@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 from collections import deque
 from dataclasses import dataclass, field
@@ -14,7 +15,7 @@ from .appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR
 from .archive_detect import COMPOUND_ZIP_EXTS, looks_like_archive, volume_info
 from .config import Config
 from .models import AttemptOutcome, Task, TaskStatus
-from .output_plan import OutputPlan, plan_output, unique_path
+from .output_plan import OutputPlan, plan_output, same_volume, unique_path
 from .password_finder import build_candidates, extract_source
 from .probe import ProbeError, check_bomb, classify_extract, probe, probe_with_password
 from .sevenzip import SevenZip, SevenZipCancelled
@@ -27,7 +28,9 @@ class RunReport:
     done: int = 0
     failed: int = 0
     needs_password: int = 0
+    skipped: int = 0
     needs_password_tasks: list[Task] = field(default_factory=list)
+    skipped_tasks: list[Task] = field(default_factory=list)
     output_dirs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -45,6 +48,7 @@ class Pipeline:
         self.output_mode = OUTPUT_WORKDIR
         self.subdir_name = "_解压开镜"
         self.copy_back = True  # workdir 模式下是否复制一份回源目录
+        self.skip_done = getattr(cfg, "skip_done", True)  # 重跑时跳过已成功解压的包
         self._plans: dict[int, OutputPlan] = {}
         cfg.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -114,6 +118,24 @@ class Pipeline:
                 skip.update(p for _, p in members[1:])
         return [f for f in files if f not in skip]
 
+    def _already_done(self, archive_path: str) -> Task | None:
+        """该路径此前是否已成功解压**且产物仍在**——两个条件缺一不可。
+
+        只查数据库记录是不够的：DONE 只是历史结论，不代表产物还躺在原地。
+        用户手动删掉产物目录再重跑是常见操作（想重新来一遍），此时若仍判
+        "已跳过"，程序会一边宣称跳过一边什么都不产出——静默失效，比重复解压
+        糟糕得多。所以产物目录的存在性是判据的一部分。
+        """
+        prev = self.store.find_done(archive_path)
+        if prev is None or not prev.extracted_dir:
+            return None
+        try:
+            if Path(prev.extracted_dir).is_dir():
+                return prev
+        except OSError:
+            return None
+        return None
+
     # ---------- 主流程 ----------
 
     def run(
@@ -162,6 +184,18 @@ class Pipeline:
                 if key in seen:
                     continue
                 seen.add(key)
+                if self.skip_done:
+                    prev = self._already_done(key)
+                    if prev is not None:
+                        report.skipped += 1
+                        report.skipped_tasks.append(prev)
+                        msg = (
+                            f"跳过已处理：{f.name}（产物仍在 {prev.extracted_dir}；"
+                            f"如需重新解压请用 --force）"
+                        )
+                        report.warnings.append(msg)
+                        self._emit({"kind": "warning", "message": msg})
+                        continue
                 task = Task(archive_path=key, depth=0, source=source or extract_source(f.name))
                 task.id = self.store.create(task)
                 run_tasks.append(task)
@@ -368,14 +402,18 @@ class Pipeline:
                 continue
 
             # 收集 T 名下被消化子包的「相对 T.out_dir 的路径」
+            #
+            # 锚点必须用 plan.out_dir，不能用 task.extracted_dir：后者是面向
+            # 用户的"产物落点"，workdir 模式下交付后会改成源目录侧的路径，
+            # 而子任务的 archive_path 记的是**工作目录**里的位置，两者一减
+            # relative_to 直接抛 ValueError → rels 为空 → 中间包永远清不掉。
+            anchor = plan.out_dir
             rels: set[str] = set()
             for child in run_tasks:
                 if child.parent_id != t.id or child.status != TaskStatus.DONE:
                     continue
                 try:
-                    rel = Path(child.archive_path).resolve().relative_to(
-                        Path(t.extracted_dir).resolve()
-                    )
+                    rel = Path(child.archive_path).resolve().relative_to(anchor.resolve())
                 except (ValueError, OSError):
                     continue
                 rels.add(str(rel).lower())
@@ -545,11 +583,12 @@ class Pipeline:
                 archive.unlink(missing_ok=True)
 
     def _deliver(self, run_tasks: list[Task], report: RunReport) -> None:
-        """workdir 模式下把最外层任务的产物复制回源压缩包所在目录。
+        """workdir 模式下把最外层任务的产物交付回源压缩包所在目录。
 
-        尽力而为：目标已存在则跳过（绝不覆盖用户既有文件），空间不足/无权限只
-        记一条警告，不影响任务的成功状态。警告同时进 report 与事件流——
-        CLI 只读 report，UI 只读事件流，两边都不能瞎。
+        同卷走 rename（单个原子系统调用，省一半写入与磁盘），跨卷才逐文件复制。
+        尽力而为：目标已存在则避让到「包名 (2)」，空间不足/无权限只记一条警告，
+        不影响任务的成功状态。警告同时进 report 与事件流——CLI 只读 report，
+        UI 只读事件流，两边都不能瞎。
         """
         for t in run_tasks:
             if t.status != TaskStatus.DONE or t.depth != 0:
@@ -561,36 +600,59 @@ class Pipeline:
             if not src.is_dir():
                 continue
 
-            def _warn(msg: str, _d=dst) -> None:
-                # 目标已存在则避让到 "包名 (2)"，与前一份产物并存
+            def _warn(msg: str) -> None:
                 plan.warnings.append(msg)
                 report.warnings.append(msg)
                 self._emit({"kind": "warning", "message": msg})
 
-            if dst.exists():
-                alt = unique_path(dst)
-                try:
-                    alt.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(src, alt, dirs_exist_ok=True)
-                except (OSError, shutil.Error) as exc:
-                    _warn(f"复制到源目录失败（产物仍在工作目录）：{alt} — {exc}")
-                else:
-                    _warn(f"目标目录已存在，产物另存为：{alt}")
+            # 目标已存在则避让到 "包名 (2)"，与前一份产物并存（绝不覆盖）
+            target = dst if not dst.exists() else unique_path(dst)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                moved = self._place_tree(src, target)
+            except (OSError, shutil.Error) as exc:
+                _warn(f"交付到源目录失败（产物仍在工作目录）：{target} — {exc}")
                 continue
 
+            if moved:
+                # 产物被搬走后真实落点变了，必须同步回任务与库——否则
+                # report.output_dirs 会指向已经消失的工作目录（UI「打开目录」失效），
+                # 库里的 extracted_dir 也会失效，令下次重跑的幂等跳过永远
+                # 判不出"产物仍在"，跳过功能在 workdir 模式下等于没做。
+                t.extracted_dir = str(target)
+                self.store.update(t)
+            if target != dst:
+                _warn(f"目标目录已存在，产物另存为：{target}")
+
+    def _place_tree(self, src: Path, dst: Path) -> bool:
+        """把 src 交付到 dst，返回是否发生了搬移（src 已不在原地）。
+
+        同卷优先 rename：单个系统调用、原子、不占额外磁盘，因此不需要
+        "留在工作目录"的兜底副本。跨卷时 rename 会在系统层退化成逐文件
+        拷贝且中途失败会留下半成品，所以仍走 copytree，把工作目录那份
+        留作安全网。rename 撞上竞态（目标被并发创建）时同样回落复制。
+        """
+        if same_volume(src, dst.parent):
             try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            except (OSError, shutil.Error) as exc:
-                _warn(f"复制到源目录失败（产物仍在工作目录）：{dst} — {exc}")
+                os.rename(src, dst)
+                return True
+            except OSError:
+                pass  # 回落 copytree：可能跨设备，或目标刚被并发创建
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        return False
 
 
     def _fill_report(self, report: RunReport, run_tasks: list[Task]) -> None:
-        parent_ids = {t.parent_id for t in run_tasks if t.parent_id is not None}
         for t in run_tasks:
             if t.status == TaskStatus.DONE:
                 report.done += 1
-                if t.id not in parent_ids and t.extracted_dir:
+                # 只报最外层任务的落点：内层产物会被 _deliver_hierarchy 归并到最
+                # 外层目录，内层自己的 out_dir 随后就被收掉了，报出来是条死路径。
+                #
+                # 旧实现按"自己没有子任务"筛（`t.id not in parent_ids`），条件正好
+                # 写反：报的恰恰是被搬空的内层目录，外层交付目录反而被排除。UI 的
+                # _open_results 会静默跳过不存在的目录，所以这个错一直没暴露。
+                if t.parent_id is None and t.extracted_dir:
                     report.output_dirs.append(t.extracted_dir)
             elif t.status == TaskStatus.FAILED:
                 report.failed += 1

@@ -220,6 +220,21 @@ class SettingsWindow(QMainWindow):
         self.attempts_spin.setRange(1, 200)
         form.addRow("密码尝试上限", self.attempts_spin)
 
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(30, 86400)
+        self.timeout_spin.setSingleStep(300)
+        self.timeout_spin.setSuffix(" 秒")
+        self.timeout_spin.setToolTip(
+            "单个压缩包的解压超时。超大包（几十 GB）在中低速磁盘上可能超过默认的 1 小时，"
+            "被中途杀掉时会报解压失败，酌情调大")
+        form.addRow("单包解压超时", self.timeout_spin)
+
+        self.skip_done_check = QCheckBox("重跑时跳过已成功解压过的包")
+        self.skip_done_check.setToolTip(
+            "开启后，之前已成功解压且产物仍在的包不再重复解压，避免同名目录越解越多。"
+            "产物被手动删除时会自动重新解压。需要强制重解时用命令行 --force")
+        form.addRow("", self.skip_done_check)
+
         self.sniff_check = QCheckBox("文件头嗅探伪装压缩包")
         self.sniff_check.setToolTip("扩展名不认识时读 magic bytes 判断是否压缩包")
         form.addRow("", self.sniff_check)
@@ -319,6 +334,8 @@ class SettingsWindow(QMainWindow):
         self.total_spin.setValue(cfg.max_total_gb)
         self.ratio_spin.setValue(cfg.max_ratio)
         self.attempts_spin.setValue(cfg.max_password_attempts)
+        self.timeout_spin.setValue(cfg.extract_timeout)
+        self.skip_done_check.setChecked(cfg.skip_done)
         self.sniff_check.setChecked(cfg.sniff_archives)
         self.keep_mid_check.setChecked(cfg.delete_intermediate is False)
         self.delete_orig_check.setChecked(cfg.keep_original is False)
@@ -346,6 +363,8 @@ class SettingsWindow(QMainWindow):
             max_total_gb=self.total_spin.value(),
             max_ratio=self.ratio_spin.value(),
             max_password_attempts=self.attempts_spin.value(),
+            extract_timeout=self.timeout_spin.value(),
+            skip_done=self.skip_done_check.isChecked(),
             sniff_archives=self.sniff_check.isChecked(),
             delete_intermediate=not self.keep_mid_check.isChecked(),
             keep_original=not self.delete_orig_check.isChecked(),

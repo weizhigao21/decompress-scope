@@ -4,7 +4,7 @@ from pathlib import Path
 from core.appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR
 from core.config import Config
 from core.models import Task, TaskStatus
-from core.output_plan import plan_output, unique_path
+from core.output_plan import plan_output, same_volume, unique_path
 
 
 def _cfg(tmp_path: Path, **overrides) -> Config:
@@ -213,3 +213,20 @@ def test_task_status_not_touched(tmp_path):
     t = _task(tmp_path)
     plan_output(t, cfg, OUTPUT_SAMEDIR)
     assert t.status == TaskStatus.PENDING
+
+
+def test_same_volume_true_within_tmp(tmp_path):
+    """同一临时目录下的两个路径必然同卷。"""
+    a = tmp_path / "x"
+    a.mkdir()
+    assert same_volume(a, tmp_path) is True
+
+
+def test_same_volume_false_when_stat_fails(tmp_path):
+    """路径不存在时按"不同卷"处理。
+
+    这是有意的保守取向：判错成不同卷只是慢一点（退回复制），
+    判错成同卷则会直接 rename 抛错、任务失败。
+    """
+    assert same_volume(tmp_path / "gone", tmp_path) is False
+    assert same_volume(tmp_path, tmp_path / "no" / "such" / "dir") is False

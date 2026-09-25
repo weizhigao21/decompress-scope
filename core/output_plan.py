@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,8 +60,20 @@ def unique_path(base: Path) -> Path:
     return base.with_name(f"{stem} ({stamp}){suffix}")
 
 
-def plan_output(
-    task,
+def same_volume(a: Path, b: Path) -> bool:
+    """两个路径是否位于同一卷——同卷才能用 rename 代替逐文件复制。
+
+    Windows 上 `os.stat().st_dev` 是卷序列号，跨盘可可靠区分。stat 失败
+    （路径不存在、无权限、网络盘抖动）一律按「不同卷」处理：退回复制只是
+    慢一点，而误判成同卷去 rename 会直接抛错、任务失败。
+    """
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def plan_output(    task,
     cfg,
     mode: str,
     subdir_name: str = "_解压开镜",

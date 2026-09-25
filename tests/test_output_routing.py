@@ -1,4 +1,5 @@
 """输出落点端到端测试：真实 7z 验证 samedir / workdir 两种模式的产物位置。"""
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -59,8 +60,13 @@ def test_samedir_lands_next_to_archive(tmp_path):
 
 
 def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
-    """同名包解两次：第二次避让为 "pack (2)"，第一份产物不被覆盖。"""
+    """同名包解两次：第二次避让为 "pack (2)"，第一份产物不被覆盖。
+
+    注意 skip_done=False：默认的幂等跳过会在第二次直接跳过已完成的任务，
+    走不到避让分支。这里显式关掉跳过，专测「避让而非覆盖」这一条不变式。
+    """
     exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    pipe.skip_done = False
     _make_zip(exe, inputs)
 
     pipe.run([inputs])
@@ -74,19 +80,136 @@ def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
     assert first.read_text(encoding="utf-8") == "第一次的产物被改过"
 
 
+def test_rerun_skips_already_done_archive(tmp_path):
+    """幂等跳过：已成功解压且产物仍在的包，重跑时不再解一遍。
+
+    回归：旧实现每次重跑都从头解压，samedir 下堆出 `pack (2)`/`pack (3)`。
+    用户把同一个下载目录反复拖进来（很常见的手势）就会越积越多。
+    """
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    _make_zip(exe, inputs)
+
+    first = pipe.run([inputs])
+    assert first.done == 1 and first.skipped == 0 and first.failed == 0
+
+    second = pipe.run([inputs])
+
+    assert second.skipped == 1, "已完成的包没被跳过，重跑又解了一遍"
+    assert second.done == 0, "跳过的任务不该计入成功"
+    assert not (inputs / "_解压开镜" / "pack (2)").exists(), "重跑堆出了重复产物目录"
+    assert any("跳过" in w for w in second.warnings), \
+        f"跳过必须给出可解释的提示，否则用户会以为程序没反应：{second.warnings}"
+
+
+def test_rerun_reprocesses_after_output_removed(tmp_path):
+    """产物被删掉时不得跳过。
+
+    跳过判据必须是「有 DONE 记录 **且** 产物还在」两个条件同时成立——
+    只看数据库记录的话，用户手动清掉产物再重跑会拿不回任何东西，
+    而程序还宣称"已跳过"，这是静默的失效。
+    """
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    _make_zip(exe, inputs)
+    pipe.run([inputs])
+
+    shutil.rmtree(inputs / "_解压开镜")  # 用户把产物删了
+
+    report = pipe.run([inputs])
+
+    assert report.skipped == 0, "产物已被删除却仍判定跳过，用户将拿不回产物"
+    assert report.done == 1
+    assert (inputs / "_解压开镜" / "pack" / "note.txt").is_file()
+
+
+def test_force_reprocess_extracts_again(tmp_path):
+    """skip_done=False（对应 CLI --force）：重跑照旧重新解压并避让。"""
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    _make_zip(exe, inputs)
+    pipe.run([inputs])
+
+    pipe.skip_done = False
+    second = pipe.run([inputs])
+
+    assert second.skipped == 0
+    assert second.done == 1
+    assert (inputs / "_解压开镜" / "pack (2)" / "note.txt").is_file()
+
+
 def test_workdir_mode_copies_back_to_source_dir(tmp_path):
-    """workdir：隔离解压后复制回源目录，源目录得到可用产物。"""
+    """workdir：隔离解压后把产物交付回源目录，源目录得到可用产物。"""
     exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_WORKDIR)
     _make_zip(exe, inputs)
 
     report = pipe.run([inputs])
 
     assert report.done == 1
-    copied = inputs / "_解压开镜" / "pack" / "note.txt"
-    assert copied.is_file(), "workdir 模式未把产物复制回源目录"
-    assert copied.read_text(encoding="utf-8") == "解压开镜 payload"
-    # 工作目录里的原件仍在（默认保留隔离产物）
-    assert list(cfg.workdir.rglob("note.txt"))
+    delivered = inputs / "_解压开镜" / "pack" / "note.txt"
+    assert delivered.is_file(), "workdir 模式未把产物交付回源目录"
+    assert delivered.read_text(encoding="utf-8") == "解压开镜 payload"
+    # 同卷交付走 rename 而非复制：工作目录里不再留一份副本（省一倍写入与磁盘）。
+    # 跨卷时仍会保留工作目录副本作为安全网，见 cross_volume 那条测试。
+    assert not list(cfg.workdir.rglob("note.txt")), \
+        "同卷交付应搬走而非复制，工作目录不该还留一份副本"
+
+
+def test_delivered_output_dir_points_at_real_path(tmp_path):
+    """交付后 report.output_dirs 必须指向真实存在的目录。
+
+    回归：同卷交付用 rename 把 out_dir 搬走后，若仍上报原来的工作目录路径，
+    UI 的「打开目录」会指向一个已经消失的位置。
+    """
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_WORKDIR)
+    _make_zip(exe, inputs)
+
+    report = pipe.run([inputs])
+
+    assert len(report.output_dirs) == 1
+    d = Path(report.output_dirs[0])
+    assert d.is_dir(), f"output_dirs 指向了不存在的路径：{d}"
+    assert any(d.iterdir()), "output_dirs 指向了空目录"
+    assert d == inputs / "_解压开镜" / "pack"
+
+
+def test_workdir_rerun_skips_after_same_volume_move(tmp_path):
+    """同卷搬走后重跑仍要能正确跳过。
+
+    回归：产物被搬走后若 extracted_dir 还留在库里的旧工作目录路径上，
+    幂等跳过判据「产物仍在」永远为假——每次重跑都重新解压一遍，
+    跳过功能在 workdir 模式下等于没做。
+    """
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_WORKDIR)
+    _make_zip(exe, inputs)
+
+    first = pipe.run([inputs])
+    assert first.done == 1
+
+    second = pipe.run([inputs])
+
+    assert second.skipped == 1, "同卷交付后重跑未跳过（extracted_dir 未随搬走更新）"
+    assert second.done == 0
+    assert not (inputs / "_解压开镜" / "pack (2)").exists()
+
+
+def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):
+    """跨卷（或同卷判定失败）时退回复制，并保留工作目录副本作安全网。
+
+    锁住"优化只在同卷生效，跨卷行为不变"：同卷 rename 是单个原子系统调用，
+    不需要兜底副本；跨卷 rename 会退化成逐文件拷贝且中途失败会留半成品，
+    所以那份副本必须留着。
+    """
+    from core import pipeline as pipeline_mod
+
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_WORKDIR)
+    _make_zip(exe, inputs)
+    monkeypatch.setattr(pipeline_mod, "same_volume", lambda a, b: False)
+
+    report = pipe.run([inputs])
+
+    assert report.done == 1
+    assert (inputs / "_解压开镜" / "pack" / "note.txt").is_file(), "跨卷仍应交付到源目录"
+    assert list(cfg.workdir.rglob("note.txt")), "跨卷交付必须保留工作目录副本兜底"
+    # 没有发生搬移，落点仍是工作目录
+    assert Path(report.output_dirs[0]).is_relative_to(cfg.workdir)
 
 
 def test_workdir_copy_back_has_no_consumed_inner_zip(tmp_path):

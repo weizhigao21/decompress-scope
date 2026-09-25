@@ -69,6 +69,23 @@ class TaskStore:
         ).fetchone()
         return self._to_task(row) if row else None
 
+    def find_done(self, archive_path: str) -> Task | None:
+        """该路径**最近一次**结论为 DONE 的记录；否则 None（供幂等跳过判定）。
+
+        为什么取"最近一次"而不是"有没有过 DONE"：同一路径可能被反复处理，
+        留下的历史里既有成功的也有后来失败的。只有最近一次是 DONE 才说明
+        上次确实解出来了；最近一次是 FAILED 时应当重新处理，不能被更早的
+        一条成功记录骗过去。
+        """
+        row = self.conn.execute(
+            f"SELECT {_SELECT_COLS} FROM tasks WHERE archive_path=? ORDER BY id DESC LIMIT 1",
+            (archive_path,),
+        ).fetchone()
+        if row is None:
+            return None
+        task = self._to_task(row)
+        return task if task.status == TaskStatus.DONE else None
+
     def list_all(self) -> list[Task]:
         rows = self.conn.execute(
             f"SELECT {_SELECT_COLS} FROM tasks ORDER BY id"

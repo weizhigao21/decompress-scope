@@ -208,3 +208,74 @@ def test_extract_no_config_ignores_file(isolated_cli, tmp_path, capsys):
     assert rc == 0, out
     # 内置默认是 samedir
     assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+
+
+def test_extract_skips_done_on_rerun_and_force_overrides(isolated_cli, tmp_path, capsys):
+    """CLI 端到端：重跑默认跳过已有产物，--force 则重新解压。
+
+    只断言「--force 被 argparse 接受」是没用的——那只证明参数存在，没证明它
+    接进了配置。这里用产物目录的实际变化来验证整条链路。
+    """
+    exe = _sevenzip_or_skip()
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "a.txt").write_text("cli payload", encoding="utf-8")
+    subprocess.run([str(exe), "a", "p.zip", "a.txt"], cwd=str(src), capture_output=True)
+    (src / "a.txt").unlink()
+
+    args = ["extract", str(src), "--samedir", "--no-config",
+            "--workdir", str(tmp_path / "wd"), "--sevenzip", str(exe)]
+
+    rc1 = cli.main(args)
+    out1 = capsys.readouterr().out
+    assert rc1 == 0, out1
+    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+
+    rc2 = cli.main(args)
+    out2 = capsys.readouterr().out
+    assert rc2 == 0, out2
+    assert "跳过" in out2, f"重跑未报告跳过：{out2}"
+    assert not (src / "_解压开镜" / "p (2)").exists(), "重跑堆出了重复产物目录"
+
+    rc3 = cli.main([*args, "--force"])
+    out3 = capsys.readouterr().out
+    assert rc3 == 0, out3
+    assert (src / "_解压开镜" / "p (2)" / "a.txt").is_file(), f"--force 未重新解压：{out3}"
+
+
+def test_extract_rejects_non_positive_timeout(isolated_cli, tmp_path, capsys):
+    """--timeout 必须为正数；报错要走我们自己的校验文案。
+
+    断言文案而不只是返回码：参数未接上时 argparse 也返回 2，只断 2 分不清
+    「参数存在但值非法」与「参数根本不存在」。
+    """
+    rc = cli.main(["extract", str(tmp_path), "--timeout", "0",
+                   "--workdir", str(tmp_path / "wd"), "--no-config"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "必须为正数" in out, f"未命中自校验分支（参数可能没接上）：{out}"
+
+
+def test_extract_timeout_reaches_config(isolated_cli, tmp_path, capsys):
+    """--timeout 一路走到 Config 并反映在结果摘要里。"""
+    exe = _sevenzip_or_skip()
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "a.txt").write_text("payload", encoding="utf-8")
+    subprocess.run([str(exe), "a", "p.zip", "a.txt"], cwd=str(src), capture_output=True)
+    (src / "a.txt").unlink()
+
+    rc = cli.main(["extract", str(src), "--samedir", "--no-config",
+                   "--workdir", str(tmp_path / "wd"), "--sevenzip", str(exe),
+                   "--timeout", "600"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "解压超时: 600s/包" in out, f"--timeout 未生效：{out}"
+
+
+def test_config_set_extract_timeout_clamped(isolated_cli, capsys):
+    """extract_timeout 可持久化，且被区间收敛（下限 30 秒）。"""
+    rc = cli.main(["config", "--set", "extract_timeout=5"])
+    capsys.readouterr()
+    assert rc == 0
+    assert AppConfig.load(isolated_cli / "config.json").extract_timeout == 30

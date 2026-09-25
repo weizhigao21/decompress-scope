@@ -4,6 +4,7 @@
     python cli.py extract <目录或文件...> [--source 域名] [--max-depth 5]
                           [--samedir | --workdir] [--subdir 名字]
                           [--no-delete-intermediate] [--delete-original]
+                          [--force] [--timeout 秒]
     python cli.py pass-add <密码> [--source 域名]
     python cli.py pass-list
     python cli.py config                # 打印当前配置
@@ -38,7 +39,15 @@ def _init_streams() -> None:
 def _print_report(report: RunReport, cfg: Config) -> None:
     print()
     print("========== 结果 ==========")
-    print(f"成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}")
+    line = f"成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}"
+    if report.skipped:
+        line += f" | 已跳过 {report.skipped}"
+    print(line)
+    if report.skipped_tasks:
+        print("-- 已跳过（此前已成功解压）--")
+        for t in report.skipped_tasks:
+            print(f"  {t.archive_path}  ->  {t.extracted_dir}")
+        print("  如需重新解压，加 --force")
     if report.output_dirs:
         print("-- 解压结果目录 --")
         for d in report.output_dirs:
@@ -53,6 +62,7 @@ def _print_report(report: RunReport, cfg: Config) -> None:
             print(f"  {w}")
     print(f"工作目录: {cfg.workdir}")
     print(f"密码库: {DEFAULT_DB}")
+    print(f"解压超时: {cfg.extract_timeout:.0f}s/包")
 
 
 def _cmd_config(args) -> int:
@@ -137,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="samedir 模式下的容器目录名(默认 _解压开镜)")
     p_ext.add_argument("--no-config", action="store_true",
                        help="忽略 config.json，全部使用内置默认值")
+    p_ext.add_argument("--force", action="store_true",
+                       help="已成功解压过的包也重新解压（关闭幂等跳过）")
+    p_ext.add_argument("--timeout", type=float, default=None,
+                       help="单个压缩包的解压超时秒数(默认 3600，超大包可调大)")
 
     p_add = sub.add_parser("pass-add", help="手工添加密码")
     p_add.add_argument("password")
@@ -200,6 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         overrides["keep_original"] = False
     if getattr(args, "no_sniff", False):
         overrides["sniff_archives"] = False
+    if getattr(args, "force", False):
+        overrides["skip_done"] = False
+    if getattr(args, "timeout", None) is not None:
+        if args.timeout <= 0:
+            print("[错误] --timeout 必须为正数")
+            return 2
+        overrides["extract_timeout"] = float(args.timeout)
 
     # 输出模式：命令行开关 > 配置
     mode = pref.output_mode

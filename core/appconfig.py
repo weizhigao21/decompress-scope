@@ -48,6 +48,7 @@ _CLAMP = {
     "max_password_attempts": (1, 200),
     "recent_inputs_limit": (0, 200),
     "session_days": (1, 365),
+    "extract_timeout": (30, 86400),
 }
 
 
@@ -131,6 +132,10 @@ class AppConfig:
     sniff_archives: bool = True
     delete_intermediate: bool = True
     keep_original: bool = True
+    # 已成功解压过（产物仍在）的包，重跑时跳过，避免 samedir 下堆出 "包名 (2)/(3)"
+    skip_done: bool = True
+    # 单个压缩包的解压超时（秒）。默认 3600 对超大包偏紧，被误杀时调大
+    extract_timeout: int = 3600
 
     # --- 输入历史 ---
     remember_inputs: bool = True
@@ -254,6 +259,8 @@ class AppConfig:
             "delete_intermediate": self.delete_intermediate,
             "keep_original": self.keep_original,
             "overwrite_existing": self.overwrite_existing,
+            "skip_done": self.skip_done,
+            "extract_timeout": float(self.extract_timeout),
         }
 
     def note_inputs(self, paths: list[str]) -> None:

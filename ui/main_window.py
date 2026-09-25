@@ -137,13 +137,26 @@ class InputList(QListWidget):
     def dragMoveEvent(self, event) -> None:
         event.acceptProposedAction()
 
-    def dropEvent(self, event) -> None:
+    def accept_urls(self, urls) -> list[str]:
+        """把拖入的本地 URL 并入列表，返回本次新增的真实路径。
+
+        主窗口与列表共用这一条通路——「哪些算新增」只在这里判一次，两处各写
+        一份迟早会漂移。
+        """
         before = set(self.real_paths())
-        self.add_paths(
-            url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()
-        )
+        self.add_paths(u.toLocalFile() for u in urls if u.isLocalFile())
+        return [p for p in self.real_paths() if p not in before]
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:
         event.acceptProposedAction()
-        added = [p for p in self.real_paths() if p not in before]
+
+    def dropEvent(self, event) -> None:
+        added = self.accept_urls(event.mimeData().urls())
+        event.acceptProposedAction()
         if added:
             self.dropped.emit(added)
 
@@ -180,10 +193,16 @@ class StatCard(QFrame):
 
 
 class MainWindow(QMainWindow):
+    DROP_HINT = "松开即可加入并开始解压"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("解压开镜")
         self.resize(1000, 680)
+        # 窗口整体是拖放目标：拖到任务树/空白区也能加入。
+        # QMainWindow 的 acceptDrops 本就是 true，但真正生效还要靠下面自己实现
+        # 的 dragEnterEvent/dropEvent——QWidget 默认实现会 ignore 掉拖放。
+        self.setAcceptDrops(True)
         self._thread: QThread | None = None
         self._worker: ExtractWorker | None = None
         self._cancel = threading.Event()
@@ -503,6 +522,9 @@ class MainWindow(QMainWindow):
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("留空则从文件名识别")
         self.source_edit.setMinimumWidth(180)
+        # QLineEdit 默认吃拖放（把文件路径当文本插入）。放行给窗口，
+        # 否则拖到这一条上既不加入输入、又冒出一串乱码路径。
+        self.source_edit.setAcceptDrops(False)
         return self.source_edit
 
     def _make_depth_spin(self) -> QSpinBox:
@@ -510,6 +532,7 @@ class MainWindow(QMainWindow):
         self.depth_spin.setRange(1, 10)
         self.depth_spin.setValue(5)
         self.depth_spin.setFixedWidth(70)
+        self.depth_spin.setAcceptDrops(False)
         return self.depth_spin
 
     def _make_total_spin(self) -> QSpinBox:
@@ -518,6 +541,7 @@ class MainWindow(QMainWindow):
         self.total_spin.setValue(50)
         self.total_spin.setFixedWidth(90)
         self.total_spin.setToolTip("解压后总大小超过此值将拒绝（防 zip 炸弹）")
+        self.total_spin.setAcceptDrops(False)
         return self.total_spin
 
     def _build_tree(self) -> QWidget:
@@ -571,6 +595,33 @@ class MainWindow(QMainWindow):
     def _on_params_toggled(self, on: bool) -> None:
         self.params_body.setVisible(on)
         self.params_toggle.setText(("收起高级参数" if on else "高级参数"))
+
+    # ---------- 拖放：窗口整体是拖放目标 ----------
+    #
+    # Qt 只把拖放交给「光标下第一个 acceptDrops 的控件」，找不到就沿父链上溯。
+    # 子控件都不接受时最终落到主窗口，所以在这里实现一次即可覆盖整窗。
+    # 提示走输入区标题而非状态栏——状态栏上可能正挂着解压进度，不能被拖放清掉。
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.input_title.setText(self.DROP_HINT)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._refresh_empty_state()  # 标题交回状态函数，避免和真实输入数量脱节
+        event.accept()
+
+    def dropEvent(self, event) -> None:
+        added = self.input_list.accept_urls(event.mimeData().urls())
+        event.acceptProposedAction()
+        if added:
+            self._on_dropped(added)
 
     # ---------- 输入管理 ----------
 
@@ -842,9 +893,20 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.start_btn.setText("开始解压")
         n = len(self.input_list.real_paths())
-        self.subtitle.setText(f"{n} 个输入 · 成功 {report.done}")
-        self.statusBar().showMessage(
-            f"完成：成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}", 0)
+        tail = f" · 跳过 {report.skipped}" if report.skipped else ""
+        self.subtitle.setText(f"{n} 个输入 · 成功 {report.done}{tail}")
+        line = f"完成：成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}"
+        if report.skipped:
+            line += f" | 已跳过 {report.skipped}"
+        self.statusBar().showMessage(line, 0)
+
+        # 全部输入都被跳过时，界面上没有任何新产物——必须明确解释，
+        # 否则用户会以为程序没反应或解压失败了。
+        if report.skipped and not report.output_dirs:
+            self.progress_label.setText(
+                f"{report.skipped} 个包此前已成功解压，本次未重复处理。"
+                f"产物仍在原处；如需重新解压请用命令行 --force。"
+            )
 
         if report.output_dirs:
             self.progress_label.setText("")

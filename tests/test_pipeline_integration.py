@@ -52,10 +52,14 @@ def test_nested_encrypted_zip(tmp_path):
     assert report.failed == 0
     assert report.needs_password == 0
     assert report.done == 2
-    notes = list(cfg.workdir.rglob("note.txt"))
+    # 断言用户实际拿到的地方：workdir 模式下产物会交付到源目录侧，
+    # 同卷时还是 rename 搬走，工作目录里自然查不到（见 P1-4）。
+    delivered = Path(report.output_dirs[0])
+    notes = list(delivered.rglob("note.txt"))
     assert notes and notes[0].read_text(encoding="utf-8") == "hello 开镜"
     assert "pw1234" in vault.candidates_for("")
-    assert list(cfg.workdir.rglob("inner.zip")) == []
+    # 中间层 inner.zip 已消化，不该交付给用户
+    assert list(delivered.rglob("inner.zip")) == []
     assert outer.exists()
 
 
@@ -190,7 +194,8 @@ def test_disguised_inner_zip_expanded(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2, "伪装成 .dat 的内层 zip 未被识别展开"
-    notes = list(cfg.workdir.rglob("note.txt"))
+    delivered = Path(report.output_dirs[0])
+    notes = list(delivered.rglob("note.txt"))
     assert notes and notes[0].read_text(encoding="utf-8") == "inner payload"
 
 
@@ -206,7 +211,8 @@ def test_compound_docx_inside_zip_not_expanded(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 1, ".docx 复合文档不应被当作压缩包展开"
-    assert list(cfg.workdir.rglob("fake.docx")), "docx 应保持原样"
+    delivered = Path(report.output_dirs[0])
+    assert list(delivered.rglob("fake.docx")), "docx 应原样交付，而不是被展开成文件树"
 
 
 def test_source_password_found_when_vault_saturated(tmp_path):

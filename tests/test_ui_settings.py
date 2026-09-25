@@ -46,6 +46,9 @@ def test_settings_window_smoke(app, tmp_path):
         assert win.depth_spin.value() == 5
         assert win.total_spin.value() == 50
         assert win.sniff_check.isChecked() is True
+        # 幂等跳过默认开；单包超时默认 3600s
+        assert win.skip_done_check.isChecked() is True
+        assert win.timeout_spin.value() == 3600
         # 删原件默认不开
         assert win.delete_orig_check.isChecked() is False
     finally:
@@ -68,6 +71,8 @@ def test_settings_collect_roundtrip(app, tmp_path):
         win.sniff_check.setChecked(False)
         win.keep_mid_check.setChecked(True)
         win.delete_orig_check.setChecked(True)
+        win.skip_done_check.setChecked(False)
+        win.timeout_spin.setValue(7200)
 
         cfg = win._collect()
         assert cfg.output_mode == OUTPUT_WORKDIR
@@ -78,6 +83,8 @@ def test_settings_collect_roundtrip(app, tmp_path):
         assert cfg.sniff_archives is False
         assert cfg.delete_intermediate is False
         assert cfg.keep_original is False
+        assert cfg.skip_done is False
+        assert cfg.extract_timeout == 7200
     finally:
         win.close()
     app.processEvents()
@@ -418,11 +425,15 @@ def test_make_cfg_uses_preferences(app, tmp_path):
     from ui.main_window import MainWindow
 
     AppConfig(autorun_mode=AUTORUN_OFF, output_mode=OUTPUT_SAMEDIR,
-              max_total_gb=3, subdir_name="_解压开镜").save(main_window.CONFIG_PATH)
+              max_total_gb=3, subdir_name="_解压开镜",
+              extract_timeout=1800, skip_done=False).save(main_window.CONFIG_PATH)
     win = MainWindow()
     try:
         cfg = win._make_cfg()
         assert cfg.max_total_uncompressed == 3 * (1024 ** 3)
+        # 新暴露的两项也必须真的流进本次运行参数，否则设置窗口就是个装饰
+        assert cfg.extract_timeout == 1800
+        assert cfg.skip_done is False
         # 折叠区控件覆盖偏好
         win.total_spin.setValue(9)
         assert win._make_cfg().max_total_uncompressed == 9 * (1024 ** 3)

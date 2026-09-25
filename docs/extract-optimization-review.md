@@ -8,20 +8,25 @@
 
 ## 结论速览
 
-| 编号 | 环节 | 问题 | 级别 | 依据 |
-|------|------|------|------|------|
-| P0-1 | 探测 probe | 加密包的 zip bomb 检查完全失效 | 严重 | 代码推导 |
-| P0-2 | 密码候选 | 来源派生密码被 `[:20]` 截断挤掉 | 严重 | 代码推导 |
-| P0-3 | 扫描入队 | `partNN` 命名分卷重复入队 | 高 | 代码推导 |
-| P1-1 | 扫描入队 | 全目录嗅探使扫描耗时 +184% | 中 | 本机实测 |
-| P1-2 | 落地产物 | 重跑不复用已完成任务 | 中 | 代码推导 |
-| P1-3 | 调度 | 任务级串行，无并发 | 中 | 代码推导 |
-| P1-4 | 落地产物 | 复制回源双倍 IO（可用 move 消除） | 低 | 代码推导 |
-| P2-1~4 | 体验 | 超时不可调 / 无总进度 / 重试成本高 | 低 | 代码推导 |
+| 编号 | 环节 | 问题 | 级别 | 依据 | 状态 |
+|------|------|------|------|------|------|
+| P0-1 | 探测 probe | 加密包的 zip bomb 检查完全失效 | 严重 | 代码推导 | 已修复 |
+| P0-2 | 密码候选 | 来源派生密码被 `[:20]` 截断挤掉 | 严重 | 代码推导 | 已修复 |
+| P0-3 | 扫描入队 | `partNN` 命名分卷重复入队 | 高 | 代码推导 | 已修复 |
+| P1-1 | 扫描入队 | 全目录嗅探使扫描耗时 +184% | 中 | 本机实测 | 已修复 |
+| P1-2 | 落地产物 | 重跑不复用已完成任务 | 中 | 代码推导 | 已修复 |
+| P1-3 | 调度 | 任务级串行，无并发 | 中 | 代码推导 | **实测后决定不做**（见下） |
+| P1-4 | 落地产物 | 复制回源双倍 IO（可用 move 消除） | 低 | 代码推导 | 已修复 |
+| P2-1 | 体验 | `extract_timeout` 无界面/CLI 入口 | 低 | 代码推导 | 已修复 |
+| P2-2~4 | 体验 | 无总进度 / 重试成本高 / `list_timeout` 无入口 | 低 | 代码推导 | 未实施 |
+
+测试基线：**170 → 196 passed**（累计新增 26 个测试）。
 
 ---
 
-## 实施进展（2026-09-26 已落地前四项）
+## 实施进展
+
+### 第一批（2026-09-26，P0 三项 + P1-1）
 
 测试基线：170 passed → **180 passed**（新增 10 个回归测试，全部先验证过"在旧实现上跑红"）。
 
@@ -30,11 +35,68 @@
 | P0-1 | 已修复 | `core/probe.py` 新增 `probe_with_password`；`core/pipeline.py` `_process` 中密码确定后复探校验，超限则删产物置 FAILED | `test_encrypted_bomb_rejected`（改前 `done=1` 跑红） |
 | P0-2 | 已修复 | `core/password_finder.py` `build_candidates`：`derived_from_source` 提到 vault 之前 | `test_source_derived_survives_truncation`、`test_source_password_found_when_vault_saturated`（改前端到端 `needs_password=1` 跑红） |
 | P0-3 | 已修复 | `core/archive_detect.py` 新增 `volume_info`；`core/pipeline.py` 新增 `_collapse_volumes`，run 入队前收敛为只解首卷 | `test_part_volumes_collapse_to_single_task`、`test_missing_first_volume_warned_and_skipped`（回退法验证精准变红） |
-| P1-1 | 已修复 | `core/archive_detect.py` 新增 `_NOT_ARCHIVE_EXTS`，`looks_like_archive` 开头短路 | `test_known_media_ext_skips_sniffing`（改前触发文件读取跑红）+ `test_unknown_ext_still_sniffed`（防退化配重） |
+| P1-1 | 已修复 | `core/archive_detect.py` 新增 `_NOT_ARCHIVE_EXTS`，`looks_like_archive` 开头短路 | `test_known_media_ext_skips_sniffing`（改前触发文件读取跑红）+ `test_unknown_ext_still_sniffs`（防退化配重） |
 
 **P1-1 实测收益**：同样的 3 万小文件目录，扫描耗时 **7782.4 ms → 2848.2 ms**，已回到纯 `rglob` 基线（2744.9 ms），即嗅探开销基本归零。且识别结果不变（伪装 `.dat` 仍能识别）。
 
-未实施：P1-2 / P1-3 / P1-4 / P2-1~4（保留后续评估）。
+### 第二批（2026-09-26，P1-2 / P1-4 / P2-1）
+
+测试基线：180 passed → **196 passed**（新增 16 个测试）。
+
+| 编号 | 状态 | 改动位置 | 验证 |
+|------|------|----------|------|
+| P1-2 | 已修复 | `core/store.py` 新增 `find_done`（取**最近一次**结论）；`Pipeline.skip_done` 默认开；CLI `--force`；`AppConfig.skip_done` + 设置窗口开关 | `test_rerun_skips_already_done_archive`（改前 `assert 0 == 1`、症状里直接出现 `pack (2)`）；`test_rerun_reprocesses_after_output_removed` 用**回退法**验证（摘掉产物存在性检查后精准变红） |
+| P1-4 | 已修复 | `core/output_plan.py` 新增 `same_volume`；`Pipeline._place_tree` 同卷 `os.rename`、跨卷回落 `copytree` | `test_workdir_mode_copies_back_to_source_dir`、`test_delivered_output_dir_points_at_real_path` 改前跑红；`test_cross_volume_delivery_keeps_workdir_copy` 锁住"跨卷行为不变" |
+| P2-1 | 已修复 | `AppConfig.extract_timeout`（`_CLAMP` 30~86400s）+ `as_overrides` + 设置窗口控件 + CLI `--timeout` | `test_extract_timeout_reaches_config`、`test_config_set_extract_timeout_clamped`；`test_make_cfg_uses_preferences` 用**回退法**验证（从 `as_overrides` 摘掉后精准变红） |
+
+**P1-4 实测收益**（200 MB 产物，同卷）：
+
+```
+copytree（复制，工作目录留底）  0.605 s
+os.rename（同卷搬移）          0.001 s   -> 约 780x，且省下 200 MB 额外磁盘
+```
+
+同卷 rename 是元数据操作，耗时与字节数无关。跨卷仍走复制并保留工作目录副本作为安全网——**优化只在同卷生效，跨卷行为不变**。
+
+### 顺带修掉的一个潜伏 bug（P1-4 暴露）
+
+`Pipeline._fill_report` 筛 `output_dirs` 的条件写反了：
+
+```python
+parent_ids = {t.parent_id for t in run_tasks if t.parent_id is not None}
+if t.id not in parent_ids:      # 旧：按"自己没有子任务"筛 -> 报的是被搬空的内层目录
+    report.output_dirs.append(t.extracted_dir)
+```
+
+本意是"只报最外层落点"，实际报的却是**最内层**目录——而内层产物早被 `_deliver_hierarchy` 归并到外层、内层 `out_dir` 随之被收掉。于是 `output_dirs` 指向一个不存在的路径。
+
+之所以长期没暴露：UI 的 `_open_results` 会静默跳过不存在的目录，CLI 也只是打印一行死路径，都没报错。修法是改判 `t.parent_id is None`。这条在改动前由 `test_disguised_inner_zip_expanded` 等三条测试跑红捕获。
+
+### P1-3 并发：实测结论（本轮**未实施**）
+
+在 16 核机器上，对真实 `7z x` 负载做串行 vs 4 并发的对照（E 盘，机械硬盘）：
+
+| 场景 | 串行 | 并发 x4 | 加速 |
+|------|------|---------|------|
+| 60 个小包（各约 2 MB，存储型） | 0.889 s | 0.282 s | **3.16x** |
+| 6 个大包（各约 60 MB，存储型） | 0.458 s | 0.243 s | **1.89x** |
+| 8 个 deflate 包（解压后约 800 MB） | 1.379 s | 0.377 s | **3.66x** |
+
+加速是真实的，但**归因很重要**：单独测 60 次 `7z` 空转启动（不做任何解压）耗时 **0.534 s**，占小包串行总耗时（0.889 s）的 **60%**（单次启动 8.9 ms）。也就是说，小包场景的收益主要来自**掩盖 7z 进程启动开销**，而不是磁盘并行。
+
+而物理上限由磁盘决定：E 盘实测顺序写入（已 `fsync`）仅 **104.8 MB/s**。解压一个 10 GB 的包，写盘下界就是约 95 秒，与并发度无关；4 路并发在机械盘上还会因读/写磁头争抢而互相拖慢。
+
+**结论：收益集中在"小包多、总量小"的场景，在绝对时间上往往只有零点几秒；而真正耗时的"大包"场景受磁盘带宽限制，并发帮不上忙、在 HDD 上甚至可能变慢。**
+
+因此 P1-3 暂不实施。若后续确要上，建议按此顺序降低风险：
+
+1. 先做**只并行探测**（probe 阶段只读、彼此独立），把 2 次 7z 启动中的 1 次移出关键路径——不需要动 sqlite 连接模型；
+2. 并发默认关，或取 `min(4, cpu//4)` 且在小文件数超过阈值时才启用；
+3. 真要并行解压，再改 sqlite（每线程独立连接或 `check_same_thread=False` + 互斥锁）并给 `_plans` / `report` 加锁。
+
+### 仍未实施
+
+P2-2 总进度、P2-3 重试成本、P2-4（`list_timeout` 界面入口未暴露，`extract_timeout` 本轮已补）。
 
 ### 实施中的一个取舍（P0-1）
 复探拿不到目录时（`probe_with_password` 返回 None）**放行而非拒绝**。理由是把它当成 bomb 会误杀"能解但探不到"的正常包——安全与可用性之间，这里选了不误伤。
