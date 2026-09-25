@@ -1,0 +1,77 @@
+classDiagram
+    class VaultEntry {
+        <<dataclass frozen>>
+        +int id
+        +str password
+        +str source
+        +int hit_count
+        +str created_at
+        +str last_hit_at
+    }
+    class SourceStat {
+        <<dataclass frozen>>
+        +str source
+        +int count
+        +int total_hits
+    }
+    class PasswordVault {
+        +Path db_path
+        +Connection conn
+        +__init__(db_path: Path)
+        +close() None
+        +record_success(password, source) None
+        +add_manual(password, source) None
+        +candidates_for(source, limit) list~str~
+        +list_all() list~tuple~
+        +query(keyword, source, order, descending, limit) list~VaultEntry~
+        +sources() list~SourceStat~
+        +count() int
+        +get(entry_id) VaultEntry
+        +delete(entry_id) bool
+        +delete_many(entry_ids) int
+        +delete_by_source(source) int
+        +update(entry_id, password, source) bool
+        +clear_all() int
+    }
+    class VaultWindow {
+        <<QMainWindow>>
+        -PasswordVault _vault
+        -str _keyword
+        -str _source_filter
+        +Signal vault_changed()
+        +__init__(db_path: Path, parent)
+        +refresh() None
+        +_build_ui() None
+        +_build_toolbar() QWidget
+        +_build_table() QWidget
+        +_build_footer() QWidget
+        +_on_search_changed(text) None
+        +_on_source_changed(text) None
+        +_selected_ids() list~int~
+        +_on_add() None
+        +_on_edit(row) None
+        +_on_copy(row) None
+        +_on_delete_selected() None
+        +_on_clear_all() None
+        +_update_actions_state() None
+        +_show_empty_state(on: bool) None
+        +closeEvent(event) None
+    }
+    class MainWindow {
+        -QPushButton vault_open_btn
+        -QLabel vault_label
+        -VaultWindow _vault_window
+        +_build_vault_panel() QWidget
+        +_open_vault_window() None
+        +_refresh_vault_label() None
+        +_on_finished(report) None
+        +closeEvent(event) None
+    }
+
+    PasswordVault ..> VaultEntry : returns
+    PasswordVault ..> SourceStat : returns
+    VaultWindow --> PasswordVault : owns (long-lived conn)
+    VaultWindow ..> VaultEntry : renders
+    VaultWindow ..> SourceStat : uses for filter
+    MainWindow --> VaultWindow : opens (singleton)
+    MainWindow ..> PasswordVault : short conn (count only)

@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# ---- 测试 ----
+.pytest_cache/
+.e2e_tmp/
+
+# ---- 运行时产物（仅本机）----
+# 密码库与任务库：属于用户私有数据
+data/
+# 隔离工作目录
+.workspace/
+# 用户偏好（含最近输入路径等本机信息，运行时持续改写）；
+# 首次启动时 AppConfig.ensure() 会自动重建默认值，无需入库
+config.json
+
+# ---- AI 协作目录（不入公开仓库）----
+.workbuddy/
+.claude/

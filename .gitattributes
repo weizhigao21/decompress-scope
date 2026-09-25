@@ -1,0 +1,18 @@
+# 仓库内统一以 LF 存储，检出时按平台转换
+* text=auto
+
+# 二进制：禁止行尾转换与 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.db    binary
+*.exe   binary
+*.7z    binary
+*.zip   binary
+
+# Windows 批处理：必须钉 CRLF。
+# 默认 core.autocrlf=true 会把仓库内的 CRLF 存成 LF，
+# 非 Windows 机器 clone 后得到 LF 行尾的 bat，cmd 的标签跳转可能解析异常。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf

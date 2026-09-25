@@ -1,0 +1,94 @@
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant MW as MainWindow
+    participant VW as VaultWindow
+    participant PV as PasswordVault
+    participant DB as SQLite (WAL)
+
+    Note over User,DB: 流程一：打开密码库窗口并加载数据
+
+    User->>MW: 点击「打开密码库」按钮
+    MW->>MW: _open_vault_window()
+    alt 单例已存在
+        MW->>VW: raise_() + activateWindow()
+    else 首次打开
+        MW->>VW: VaultWindow(DEFAULT_DB, parent=self)
+        VW->>PV: PasswordVault(db_path)
+        PV->>DB: CREATE TABLE IF NOT EXISTS + PRAGMA WAL/busy_timeout
+        PV-->>VW: vault 实例（长连接）
+        VW->>VW: _build_ui() 组装工具条/表格/页脚/空态
+        VW->>VW: refresh()
+        VW->>PV: sources()
+        PV->>DB: SELECT source, COUNT(*), SUM(hit_count) GROUP BY source
+        DB-->>PV: rows
+        PV-->>VW: list[SourceStat]
+        VW->>VW: 填充来源下拉（全部来源 / a.com (12) / ...）
+        VW->>PV: query(keyword="", source=None, order="source")
+        PV->>DB: SELECT id,password,source,hit_count,created_at,last_hit_at
+        DB-->>PV: rows
+        PV-->>VW: list[VaultEntry]
+        VW->>VW: 渲染表格；无数据则 _show_empty_state(True)
+    end
+    VW-->>User: 窗口显示，含全部密码
+
+    Note over User,DB: 流程二：搜索 / 来源筛选
+
+    User->>VW: 在搜索框输入 "qq"
+    VW->>VW: _on_search_changed("qq") 防抖 200ms
+    VW->>VW: refresh()
+    VW->>PV: query(keyword="qq", source=当前筛选, order="source")
+    PV->>DB: SELECT ... WHERE (password LIKE ? OR source LIKE ?) AND ...
+    DB-->>PV: rows
+    PV-->>VW: list[VaultEntry]
+    VW->>VW: 重绘表格 / 空态切换为「无匹配」
+
+    Note over User,DB: 流程三：删除一条密码并同步主窗口计数
+
+    User->>VW: 选中一行，点击「删除选中」
+    VW->>VW: _on_delete_selected()
+    VW->>VW: _selected_ids() -> [7]
+    VW->>User: QMessageBox.question 二次确认
+    User-->>VW: 确认
+    VW->>PV: delete_many([7])
+    PV->>DB: BEGIN; DELETE FROM passwords WHERE id IN (7); COMMIT
+    DB-->>PV: rowcount=1
+    PV-->>VW: 1
+    VW->>VW: refresh() 重新查询并重绘表格
+    VW->>VW: _update_actions_state() 无选中则禁用按钮
+    VW-)MW: emit vault_changed
+    MW->>MW: _refresh_vault_label()
+    MW->>PV: PasswordVault(DEFAULT_DB) 短连接
+    PV->>DB: SELECT COUNT(*) FROM passwords
+    DB-->>PV: n
+    PV-->>MW: n
+    MW->>PV: close()
+    MW->>MW: vault_label.setText("共 n 条")
+
+    Note over User,DB: 流程四：编辑密码撞唯一约束（合并语义）
+
+    User->>VW: 双击一行 -> 编辑
+    VW->>User: QInputDialog 输入新密码
+    User-->>VW: "duplicate_pw"
+    VW->>PV: update(entry_id=9, password="duplicate_pw")
+    PV->>DB: 查目标行 + 查是否已存在 (duplicate_pw, source)
+    alt 已存在冲突行 (id=3)
+        PV->>DB: UPDATE id=3 SET hit_count = hit_count + 被编辑行.hit_count
+        PV->>DB: DELETE FROM passwords WHERE id=9
+        PV-->>VW: True（合并完成）
+    else 无冲突
+        PV->>DB: UPDATE passwords SET password=? WHERE id=9
+        PV-->>VW: True
+    end
+    VW->>VW: refresh()
+    VW-)MW: emit vault_changed
+    MW->>MW: _refresh_vault_label() 计数同步（可能 -1）
+
+    Note over User,DB: 流程五：窗口关闭
+
+    User->>VW: 关闭窗口 (X)
+    VW->>VW: closeEvent(event)
+    VW->>PV: close()
+    PV->>DB: 关闭连接
+    VW->>VW: destroyed 信号
+    MW->>MW: self._vault_window = None（下次点击重建单例）
