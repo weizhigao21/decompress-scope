@@ -72,8 +72,8 @@ os.rename（同卷搬移）          0.001 s   -> 约 780x，且省下 200 MB �
 | 交付失败不落库 | `_deliver` 的 `except` 只 `_warn(...) + continue` | `Task.delivery_error` 落库（`tasks` 表加列 + 老库 `ALTER TABLE` 迁移）；`_record_delivery_failure` 同时进 report 与事件流 | `test_copy_back_failure_is_persisted`；注入「不落库」后 4 条精准变红 |
 | 归并失败**静默丢弃** | `_deliver_hierarchy` 的 `except (ValueError, OSError): continue`，连警告都没有 | 同上，并写明"内层包已不在父产物内" | `test_hierarchy_unlocatable_archive_is_reported_not_silent`；注入回 `continue` 后精准变红 |
 | 跨卷交付后落点仍指工作目录 | `_deliver` 只有 `moved=True` 才更新 `extracted_dir` | 交付成功即更新（搬移与复制都算成功） | `test_successful_delivery_points_extracted_dir_at_target`、`test_cross_volume_delivery_keeps_workdir_copy`（后者是**既有测试**，语义变更后同步更新并写明理由） |
-| 残留无法盘点、无法清理 | 无 | 新增 `core/workdir_cleanup.py`（`scan_workdir` 定性、`prune` 三道闸）+ CLI `clean-workdir` + `ui/workdir_window.py` + 主界面常驻计数入口 | `tests/test_workdir_cleanup.py`（16 条）、`tests/test_ui_undelivered.py`（18 条） |
-| 清理 > 2 GiB 后主界面计数不刷新（**功能静默失效**） | `WorkdirWindow.cleaned = Signal(int)` —— PySide6 映射到 C++ **32 位** int，上限 2 GiB；`emit()` 越界**不抛异常**，只发一条 shiboken Overflow 警告再丢掉信号 | 改 `Signal("qint64")`；新增静态扫描禁止 ui 层出现裸 `Signal(int)` | 三条独立守卫：静态扫描 / 槽收到的值 / 端到端页脚计数归零；把签名回退后**三条同时精准变红** |
+| 残留无法盘点、无法清理 | 无 | 新增 `core/workdir_cleanup.py`（`scan_workdir` 定性、`prune` 三道闸）+ CLI `clean-workdir` + `ui/workdir_window.py` + 残留计数入口（**现位于 设置 → 输出位置**，最初常驻主界面底部，后随低频设置一起移入设置窗口） | `tests/test_workdir_cleanup.py`（16 条）、`tests/test_ui_undelivered.py`（19 条） |
+| 清理 > 2 GiB 后残留计数不刷新（**功能静默失效**） | `WorkdirWindow.cleaned = Signal(int)` —— PySide6 映射到 C++ **32 位** int，上限 2 GiB；`emit()` 越界**不抛异常**，只发一条 shiboken Overflow 警告再丢掉信号 | 改 `Signal("qint64")`；新增静态扫描禁止 ui 层出现裸 `Signal(int)` | 三条独立守卫：静态扫描 / 槽收到的值 / 端到端计数归零（当时断的是主界面页脚，入口移入设置后同样的三条断言改断设置窗口） |
 
 **定性与安全边界**（核心决策）：
 
@@ -321,6 +321,15 @@ candidates = build_candidates(archive.name, task.source, vault_candidates)[: sel
 
 **验证方式**：构造 vault 中 20 条均不匹配的密码 + 一个用来源域名作密码的包，断言能解出；改前跑红（会被截断而失败）。
 
+**2026-09-26 复核追加**：上面的改法只解决了"顺序"，没解决"库检索范围"。当时仍留着两处说不通的地方：
+
+1. `candidates_for(source, limit=20)` 里的 `20` 是**硬编码**的，紧接着调用方又 `[:max_password_attempts]` 截断一次 —— **截断发生两次**，于是用户把「密码尝试」从 20 调到 200 完全不生效。设置项在说谎。
+2. 该函数在 `source` 非空时只查 `source=?` 与 `source=''` 两组，**跨来源的条目永远不会被试**。而 `record_success` 是按 `extract_source(文件名)` 写入的，所以来源一分组就互不通气。
+
+现已改为：库配额取自 `cfg.max_password_attempts`；检索改为单条 SQL 的三段式排序（同来源 → 无来源 → 其他来源，段内 `hit_count DESC, last_hit_at DESC`），`limit` 作用在**排序去重之后**，0 = 不限。跨来源参与的理由见 `PasswordVault.candidates_for` 的 docstring —— 站点归属是**排序信号**，不是隔离边界（同一发布者批量打包、用户复用同一密码都是常态）。
+
+**注意别改回去**：`test_candidates_ordering` / `test_candidates_limit_truncates_after_priority` / `test_candidate_budget_follows_setting_and_reaches_other_sources` 三条钉住了新语义，把 `limit` 改回硬编码 20 或把 SQL 改回按来源隔离，它们会精准变红（已做过注入验证）。
+
 ---
 
 ### P0-3 `partNN` 命名分卷重复入队
@@ -426,6 +435,41 @@ b) **更好：用 probe 已有的 entries 预判**。`probe()` 已经把条目�
 避免"优化"反而引入风险，以下三项经实测确认健康：
 
 1. **密码逐候选尝试**：错误密码 7z 快速失败（0.012s/次），不是性能瓶颈。
+
+   **2026-09-26 复测与上界**（起因：有人问"我写的破解器 15 万次/秒，提前算好 MD5 不该很快吗"）。
+   实测单次「错误密码」尝试：`.7z` 19.4 ms、`.7z`(`-mhe=on`) 18.8 ms、`.zip`(ZipCrypto) 24.8 ms、
+   `.zip`(AES-256) 30.8 ms → **32–53 次/秒**。同机裸 MD5 循环 1,424,659 次/秒。
+   差距的成因有三层，**都不是代码写得慢**：
+
+   - **进程创建 8.9 ms 起跳**（实测纯 `7z.exe` 启动），这一项就把上界锁在 ~113 次/秒。
+     想提速只能离开子进程模型。
+   - **包加密用的是加盐高强度 KDF**：7z = SHA-256 迭代 2¹⁹（524,288 轮）；WinZip AES =
+     PBKDF2-HMAC-SHA1 1000 轮 + 每文件盐；RAR5 = PBKDF2-HMAC-SHA256 2¹⁵ 轮 + 盐。
+     "预计算 MD5 表"**完全无用**——目标哈希随每个包的盐重新生成，等于每换一个包就要重算整张表。
+     那个"十几万次/秒"是无盐单轮 MD5 的成绩，与包加密不是同一件事。
+   - **进程内验证只在 zip 上有意义**：`hashlib.pbkdf2_hmac` 是 C 实现，实测 2,009 次/秒
+     （≈50× 提速），但要自己解析 local header 取盐与 2 字节验证值。
+     **7z 不能这么干**：52 万轮 KDF 纯 Python 逐次调用要 0.29 s，比让 `7z.exe` 干（~19 ms）还慢 15 倍。
+
+   结论：只要还走 `7z.exe`，`max_password_attempts` 每加 1 就是每包约 20 ms。
+   配额定在 20 时，单个需密码的包最坏约 0.4 s —— 这是**设计上限，不是瓶颈**。
+
+   **2026-09-26 后续**：用户随即撞上「这个数字改不动」。原因不是控件坏了，而是上限
+   被写死成 **200**，且在**两处**各写了一份 —— `core/appconfig.py` 的 `_CLAMP`
+   （`normalize()` 在加载与保存前都会跑，连手改 config.json 都会被打回）与
+   `ui/settings_window.py` 的 `setRange(1, 200)`。用户想让它试完整个库，输入被无声
+   夹回，界面上完全看不出是谁夹的。
+
+   已改：上限放开到 **2000**（与 `core/vault.py` 的 `_SCAN_CAP = 2000` 对齐，避免
+   "配额允许 3000 条、库却只吐 2000 条"的第二层隐形天花板）；新增
+   `core.appconfig.clamp_bounds(name)`，设置窗口所有数字框的范围**只从这一份定义取**
+   （`SettingsWindow._spin`），UI 里不再出现第二份常量；控件下方实时显示
+   "最坏 ≈ N 秒/需密码的包"，让放开的代价可见。
+
+   **守卫**：`test_numeric_control_ranges_come_from_core_bounds`（钉 UI 与 core 的
+   一致性）、`test_attempts_can_go_past_200_and_survives_save`（钉"真的能调上去并存住"）、
+   `test_attempts_hint_shows_worst_case_cost`。注入验证：上限退回 200 → 第二条红；
+   UI 自写一份范围 → 第一条红。
 2. **7z 风格分卷识别**：`.001` 命中、`.002+` 正确跳过，行为正确。
    ⚠️ 更正（见第四批）：**识别**确实没问题，但同一批改动之外还藏着"只按首卷算包体大小"的
    缺陷——分卷那条链路当时只验了"入队几条"，没验"大小报多少"。

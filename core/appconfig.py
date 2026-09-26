@@ -45,11 +45,27 @@ _CLAMP = {
     "max_depth": (1, 10),
     "max_total_gb": (1, 2000),
     "max_ratio": (1.0, 100000.0),
-    "max_password_attempts": (1, 200),
+    # 上限 2000 而不是 200：这个值同时是"密码库能贡献多少条候选"的配额，
+    # 而 vault.candidates_for 的单次扫描上限也是 2000（见 core/vault.py 的 _SCAN_CAP）
+    # —— 两边对齐，才不会出现"配额允许 3000 条、库却只吐 2000 条"的隐形天花板。
+    # 代价是线性的：每个候选都要让 7z 重新派生一次密钥，实测约 20 ms。
+    # 2000 意味着单个需密码的包最坏约 40 秒（设置窗口会在控件下方实时显示这个估算）。
+    "max_password_attempts": (1, 2000),
     "recent_inputs_limit": (0, 200),
     "session_days": (1, 365),
     "extract_timeout": (30, 86400),
 }
+
+
+def clamp_bounds(name: str) -> tuple[float, float] | None:
+    """字段的合法区间 (下限, 上限)；未登记则返回 None。
+
+    给 UI 层设控件范围用的。**范围只能有这一份定义**——两边各写一份的话，迟早
+    出现"控件明明能调到 500、一保存却被夹回 200"的鬼打墙：用户的输入被静默吞掉，
+    而且从界面上完全看不出是谁夹的（`normalize()` 在加载和保存前都会跑一次，
+    连手改 config.json 都会被打回）。
+    """
+    return _CLAMP.get(name)
 
 
 def sanitize_component(name: str) -> str:
@@ -129,6 +145,11 @@ class AppConfig:
     max_total_gb: int = 50
     max_ratio: float = 1000.0
     max_password_attempts: int = 20
+    # 密码来源（通常是站点域名）：用于派生候选密码（域名、www.域名）。
+    # 留空 = 每个包各自从自己的文件名里识别来源。
+    # 它不进 Config，而是每次 run 时作为 Pipeline.run(source=...) 传入——
+    # 所以不进 as_overrides()，由调用方（ui/main_window.py）直接取用。
+    password_source: str = ""
     sniff_archives: bool = True
     delete_intermediate: bool = True
     keep_original: bool = True
@@ -217,6 +238,7 @@ class AppConfig:
             self.open_after = OPEN_PATHS
 
         self.workdir = (self.workdir or "").strip()
+        self.password_source = (self.password_source or "").strip()
         # 子目录名消毒复用 output_plan 的同一份实现，避免两处各写一份而漏掉盘符。
         # 原值为空/纯非法字符时 sanitize 会给出兜底 "output"，这里换回用户可读的默认名。
         raw_sub = (self.subdir_name or "").strip()

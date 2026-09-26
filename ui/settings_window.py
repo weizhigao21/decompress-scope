@@ -2,13 +2,17 @@
 
 为什么改成导航式：原先 4 个分组纵向堆成一列，实测窗口被 minimumSizeHint 顶到
 **1220px**（代码里的 resize(620,660) 形同废纸），1080p 屏上底部的「保存」根本看不见；
-20 个控件连成一条长卷轴，模块之间也没有边界感。现在按「这个设置管什么」切成 5 个
+20 个控件连成一条长卷轴，模块之间也没有边界感。现在按「这个设置管什么」切成 6 个
 模块：左列选模块、右侧只渲染当前模块，底部操作条固定住不跟着滚。
 
 模块划分规则：**数字归数字、开关归开关**。
 「解压阈值」页全是数值、「解压行为」页全是开关。此前 9 个开关都以
 `addRow("", cbox)` 的形式塞在字段列里、紧贴上一行输入框，看起来像是那个输入框的
 附属说明；现在每个开关都是**有标签的一行**（标签列写设置主题、复选框写动作）。
+
+本窗口是**所有低频设置的唯一去处**：主窗口头部的两个开关只是快捷档位，
+其余参数（解压深度/上限、密码来源、各类解压开关、工作目录残留的盘点入口）
+一律在这里改。同一个值有两处入口，迟早会出现"界面上显示 50、实际生效 3"。
 
 其余设计要点：
 - 底部操作条放在滚动区**外面**：任何页面、任何滚动位置，「保存」都够得着。
@@ -18,6 +22,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -50,8 +55,12 @@ from core.appconfig import (
     OUTPUT_SAMEDIR,
     OUTPUT_WORKDIR,
     AppConfig,
+    clamp_bounds,
 )
+from core.formatting import human_size
+from core.workdir_cleanup import iter_task_dirs
 from ui import theme
+from ui.workdir_window import WorkdirWindow
 
 _AUTORUN_LABELS = {
     AUTORUN_OFF: "关闭（手动点开始）",
@@ -72,6 +81,12 @@ _OUTPUT_HINTS = {
 # 取「最大嵌套深度」（6 字 ≈ 78px）+ 余量，各页共用同一个值。
 _LABEL_W = 88
 
+# 单个密码候选的实测开销，用来给「密码尝试」估算最坏耗时。
+# 每次尝试都要新起一个 7z.exe（进程创建本身约 9 ms）并重新派生密钥
+# （7z 格式 = SHA-256 迭代 2^19 轮），实测 19~31 ms，取 20 ms。
+# 实测方法与全部数据见 docs/extract-optimization-review.md 第四节。
+_MS_PER_CANDIDATE = 20
+
 
 class SettingsWindow(QMainWindow):
     """偏好设置窗口。保存成功后 emit saved(cfg)。"""
@@ -79,7 +94,8 @@ class SettingsWindow(QMainWindow):
     saved = Signal(object)     # AppConfig
     closed = Signal()
 
-    def __init__(self, cfg: AppConfig, config_path: Path, project_root: Path, parent=None):
+    def __init__(self, cfg: AppConfig, config_path: Path, project_root: Path,
+                 db_path: Path | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.resize(780, 620)
@@ -87,6 +103,11 @@ class SettingsWindow(QMainWindow):
         self._cfg = cfg
         self._config_path = Path(config_path)
         self._project_root = Path(project_root)
+        # 残留盘点要用任务库判定「这份残留是否已交付过」。不传则按项目内的
+        # 默认库位置推——显式传参的调用方（主窗口）给的才是真正在用的那个库。
+        self._db_path = Path(db_path) if db_path else (self._project_root / "data" / "jieya.db")
+        self._workdir_window: WorkdirWindow | None = None
+        self._workdir_window_dir: Path | None = None
         self._build_ui()
         self._load_from_cfg(cfg)
 
@@ -119,6 +140,7 @@ class SettingsWindow(QMainWindow):
         self._add_page("启动与拖入", "什么情况下自动开始解压", self._page_start)
         self._add_page("解压阈值", "安全边界：超过任一上限即拒绝解压", self._page_limits)
         self._add_page("解压行为", "解压过程中的开关", self._page_behavior)
+        self._add_page("密码", "密码从哪些线索里找、每个包最多试几个", self._page_password)
         self._add_page("记录与历史", "输入路径与任务记录的保留策略", self._page_history)
 
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -182,6 +204,8 @@ class SettingsWindow(QMainWindow):
         self.workdir_edit.setPlaceholderText("留空 = 项目目录下的 .workspace")
         self.workdir_edit.setToolTip(
             "隔离解压与内层包展开都在这里进行。留空则用项目目录下的 .workspace")
+        # 改了路径立刻重算残留计数：用户改完就想知道"这个目录里现在有没有东西"
+        self.workdir_edit.textChanged.connect(self._refresh_residue)
         work_box.addWidget(self.workdir_edit, stretch=1)
         btn_pick = QPushButton("选择…")
         btn_pick.setProperty("ghost", "true")
@@ -200,6 +224,45 @@ class SettingsWindow(QMainWindow):
         self.overwrite_check.setToolTip(
             "关闭时（推荐）遇到同名目录自动改名为「xxx (2)」，绝不覆盖既有产物")
         form2.addRow(self._field_label("同名产物"), self.overwrite_check)
+
+        col.addSpacing(6)
+        col.addWidget(self._build_residue_panel())
+
+    def _build_residue_panel(self) -> QWidget:
+        """工作目录残留入口：一行 = 标题 + 残留项数 + 「查看/清理」。
+
+        为什么需要它：工作目录里的东西**全都**是「解压成功」状态（库里 done、
+        任务树显示"完成"），用户没有任何线索知道磁盘被吃了多少，也没有入口清掉
+        ——实测 task_83 一次就留下 5.38 GB。这个入口原先常驻在主界面底部，
+        现在随其余设置一起收进这里，主界面只留「添加输入 → 开始解压」一条主线。
+
+        计数只用一层 iterdir，绝不递归统计大小：这段代码在切页时就会跑，为了
+        一个数字去走几十万个文件会把窗口卡住。真实占用点开「查看/清理」才算。
+        """
+        panel = QFrame()
+        panel.setProperty("panel", "true")
+        row = QHBoxLayout(panel)
+        row.setContentsMargins(12, 10, 12, 10)
+        row.setSpacing(8)
+
+        title = QLabel("工作目录残留")
+        row.addWidget(title)
+
+        # 颜色走 QSS 的 [warn="true"] 规则而不是内联样式表：这里的状态会在
+        # 「有残留 / 无残留」之间反复切换，内联写法每切一次就重铺一遍样式表。
+        self.residue_label = QLabel("")
+        self.residue_label.setProperty("role", "residue")
+        row.addWidget(self.residue_label)
+
+        row.addStretch(1)
+
+        self.residue_open_btn = QPushButton("查看/清理")
+        self.residue_open_btn.setProperty("ghost", "true")
+        self.residue_open_btn.setCursor(Qt.PointingHandCursor)
+        self.residue_open_btn.setToolTip("盘点隔离工作目录里的残留产物，确认后清理")
+        self.residue_open_btn.clicked.connect(self._open_workdir_window)
+        row.addWidget(self.residue_open_btn)
+        return panel
 
     def _page_start(self, col: QVBoxLayout) -> None:
         form = self._form(col)
@@ -223,39 +286,63 @@ class SettingsWindow(QMainWindow):
     def _page_limits(self, col: QVBoxLayout) -> None:
         form = self._form(col)
 
-        self.depth_spin = QSpinBox()
-        self.depth_spin.setRange(1, 10)
+        self.depth_spin = self._spin("max_depth")
         self.depth_spin.setSuffix(" 层")
         self.depth_spin.setToolTip("内层压缩包递归展开的层数上限，超过的内层包不再展开")
         form.addRow(self._field_label("嵌套深度"), self.depth_spin)
 
-        self.total_spin = QSpinBox()
-        self.total_spin.setRange(1, 2000)
+        self.total_spin = self._spin("max_total_gb")
         self.total_spin.setSuffix(" GB")
         self.total_spin.setToolTip("解压后总大小超过此值将拒绝，防 zip 炸弹")
         form.addRow(self._field_label("大小上限"), self.total_spin)
 
-        self.ratio_spin = QDoubleSpinBox()
-        self.ratio_spin.setRange(1.0, 100000.0)
-        self.ratio_spin.setDecimals(0)
+        self.ratio_spin = self._spin("max_ratio")
         self.ratio_spin.setSuffix(" : 1")
         self.ratio_spin.setToolTip("解压后大小 ÷ 压缩包大小超过此值即拒绝，防 zip 炸弹")
         form.addRow(self._field_label("压缩比上限"), self.ratio_spin)
 
-        self.attempts_spin = QSpinBox()
-        self.attempts_spin.setRange(1, 200)
-        self.attempts_spin.setSuffix(" 个")
-        self.attempts_spin.setToolTip("每个压缩包最多试几个候选密码，试完仍失败则标记「待密码」")
-        form.addRow(self._field_label("密码尝试"), self.attempts_spin)
-
-        self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(30, 86400)
+        self.timeout_spin = self._spin("extract_timeout")
         self.timeout_spin.setSingleStep(300)
         self.timeout_spin.setSuffix(" 秒")
         self.timeout_spin.setToolTip(
             "单个压缩包的解压超时。超大包（几十 GB）在中低速磁盘上可能超过默认的 1 小时，"
             "被中途杀掉时会报解压失败，酌情调大")
         form.addRow(self._field_label("单包超时"), self.timeout_spin)
+
+    def _page_password(self, col: QVBoxLayout) -> None:
+        """密码相关：来源标识 + 候选数量。
+
+        这两项原先分居两处——「密码来源」在主界面折叠区、「密码尝试」在本窗口的
+        阈值页——而它们说的本来就是同一件事（拿什么去试、试几个）。聚到一页。
+        """
+        form = self._form(col)
+
+        self.source_edit = QLineEdit()
+        self.source_edit.setPlaceholderText("留空 = 每个包从自己的文件名识别")
+        self.source_edit.setToolTip(
+            "候选密码按「文件名 → 来源派生 → 密码库 → 常用字典」的顺序尝试。"
+            "来源通常填站点域名，程序会拿它和 www.<域名> 一起当候选。"
+            "留空时每个包各自从自己的文件名里识别来源")
+        # QLineEdit 默认吃拖放（把文件路径当文本插进去），关掉避免误拖出乱码
+        self.source_edit.setAcceptDrops(False)
+        form.addRow(self._field_label("密码来源"), self.source_edit)
+
+        self.attempts_spin = self._spin("max_password_attempts")
+        self.attempts_spin.setSuffix(" 个")
+        # 上限从 core 的边界里取，不在 tooltip 里再写一遍数字
+        _lo, _hi = clamp_bounds("max_password_attempts") or (1, 200)
+        self.attempts_spin.setToolTip(
+            f"每个压缩包最多试几个候选密码（{_lo}–{_hi}），试完仍失败则标记「待密码」。\n\n"
+            "它同时决定密码库能贡献几条：调大才会让库里靠后的条目轮到"
+            "（库按「同来源 → 无来源 → 其他来源」排序，高命中率的排在前面）。\n\n"
+            "代价是每个候选都要让 7z 重新派生一次密钥，实测约 20 ms，"
+            "所以这个值直接决定单个需密码的包最坏要等多久。非加密包不受影响。")
+        self.attempts_hint = self._hint()
+        # 实时把"这个数字意味着等多久"摆在用户眼前。上限一旦放开，没有这行提示，
+        # 用户会毫无察觉地把单包等待时间设成几十秒，然后以为程序卡死了。
+        self.attempts_spin.valueChanged.connect(self._refresh_attempts_hint)
+        form.addRow(self._field_label("密码尝试"),
+                    self._stack(self.attempts_spin, self.attempts_hint))
 
     def _page_behavior(self, col: QVBoxLayout) -> None:
         """纯开关页：整页只有开关，所以不必担心哪个控件被误读成上一行的附属说明。"""
@@ -292,14 +379,12 @@ class SettingsWindow(QMainWindow):
             "默认关闭：程序一开就自动解压上次的内容通常不是你想要的")
         form.addRow(self._field_label("启动恢复"), self.restore_check)
 
-        self.recent_spin = QSpinBox()
-        self.recent_spin.setRange(0, 200)
+        self.recent_spin = self._spin("recent_inputs_limit")
         self.recent_spin.setSuffix(" 条")
         self.recent_spin.setToolTip("0 = 不记录任何历史")
         form.addRow(self._field_label("保留条数"), self.recent_spin)
 
-        self.keep_days_spin = QSpinBox()
-        self.keep_days_spin.setRange(1, 365)
+        self.keep_days_spin = self._spin("session_days")
         self.keep_days_spin.setSuffix(" 天")
         self.keep_days_spin.setToolTip("任务记录（不是输入历史）在数据库里的保留天数")
         form.addRow(self._field_label("任务记录"), self.keep_days_spin)
@@ -361,6 +446,24 @@ class SettingsWindow(QMainWindow):
             col.addWidget(w)
         return wrap
 
+    @staticmethod
+    def _spin(name: str):
+        """按 core 的边界建一个数字框（float 边界 → QDoubleSpinBox）。
+
+        范围**只**取自 `core.appconfig._CLAMP`，这里绝不再写一份常量。两边各写
+        一份时，界面会允许用户调到一个 core 不认的值，然后在保存时被静默夹回去
+        —— 用户看到自己的输入凭空消失，却说不出是谁干的。`_make_cfg` 那类
+        "两个入口必然不一致"的坑，根子都在这里。
+        """
+        lo, hi = clamp_bounds(name) or (0, 0)
+        if isinstance(lo, float):
+            sp = QDoubleSpinBox()
+            sp.setDecimals(0)
+        else:
+            sp = QSpinBox()
+        sp.setRange(lo, hi)
+        return sp
+
     def _build_actions(self) -> QWidget:
         bar = QWidget()
         row = QHBoxLayout(bar)
@@ -419,6 +522,7 @@ class SettingsWindow(QMainWindow):
         self.depth_spin.setValue(cfg.max_depth)
         self.total_spin.setValue(cfg.max_total_gb)
         self.ratio_spin.setValue(cfg.max_ratio)
+        self.source_edit.setText(cfg.password_source)
         self.attempts_spin.setValue(cfg.max_password_attempts)
         self.timeout_spin.setValue(cfg.extract_timeout)
         self.skip_done_check.setChecked(cfg.skip_done)
@@ -428,13 +532,13 @@ class SettingsWindow(QMainWindow):
         self.keep_days_spin.setValue(cfg.session_days)
 
         self._sync_output_dependents()
+        self._refresh_attempts_hint()
         self._refresh_history_label(cfg)
+        self._refresh_residue()
 
     def _collect(self) -> AppConfig:
         """控件 → 配置（基于原 cfg 派生，保留本窗口未暴露的字段）。"""
-        import dataclasses
-
-        return dataclasses.replace(
+        return replace(
             self._cfg,
             output_mode=self.output_combo.currentData() or OUTPUT_SAMEDIR,
             subdir_name=self.subdir_edit.text().strip() or "_解压开镜",
@@ -449,6 +553,7 @@ class SettingsWindow(QMainWindow):
             max_depth=self.depth_spin.value(),
             max_total_gb=self.total_spin.value(),
             max_ratio=self.ratio_spin.value(),
+            password_source=self.source_edit.text().strip(),
             max_password_attempts=self.attempts_spin.value(),
             extract_timeout=self.timeout_spin.value(),
             skip_done=self.skip_done_check.isChecked(),
@@ -457,6 +562,18 @@ class SettingsWindow(QMainWindow):
             keep_original=not self.delete_orig_check.isChecked(),
             session_days=self.keep_days_spin.value(),
         ).normalize()
+
+    def _refresh_attempts_hint(self) -> None:
+        """把「密码尝试」的数字翻译成用户真正关心的东西：单个包最坏要等多久。
+
+        只算**最坏**（全部候选都不匹配）。真实情况下命中往往在前几条，因为库是按
+        命中率排序的；这里不做乐观估计，宁可让用户以为慢一点。
+        """
+        n = self.attempts_spin.value()
+        secs = n * _MS_PER_CANDIDATE / 1000.0
+        self.attempts_hint.setText(
+            f"最坏 ≈ {secs:.1f} 秒/需密码的包（每个候选约 {_MS_PER_CANDIDATE} ms）；"
+            "非加密包不受影响。")
 
     def _sync_output_dependents(self) -> None:
         """按输出模式启用/禁用只在某模式下才成立的开关。
@@ -482,6 +599,64 @@ class SettingsWindow(QMainWindow):
             preview = "、".join(Path(p).name for p in cfg.recent_inputs[:3])
             more = f" 等 {n} 条" if n > 3 else ""
             self.history_label.setText(f"已记录 {n} 条：{preview}{more}")
+
+    # ---------- 工作目录残留 ----------
+
+    def _effective_workdir(self) -> Path:
+        """面板里那个工作目录的绝对路径。
+
+        以**输入框**为准而不是已保存的配置：用户改完路径还没点保存时，
+        他看的就是这个目录里的东西，计数跟着它走才不会让人以为改了个假的。
+        留空时的回落逻辑复用 AppConfig.resolve_workdir，不在这里再写一份。
+        """
+        return replace(self._cfg, workdir=self.workdir_edit.text().strip()) \
+            .resolve_workdir(self._project_root)
+
+    def _refresh_residue(self) -> None:
+        """重算残留项数。只读一层目录，不递归。"""
+        n = len(iter_task_dirs(self._effective_workdir()))
+        self.residue_label.setText(f"{n} 项残留" if n else "无残留")
+        self._set_warn(self.residue_label, bool(n))
+
+    @staticmethod
+    def _set_warn(widget: QWidget, on: bool) -> None:
+        """切换警示色。
+
+        动态属性改动后**必须**重新 polish：QSS 的属性选择器不会自己重算，
+        只 setProperty 的话颜色会一直停在初始那一档（表现为"有残留也不变色"）。
+        """
+        if bool(widget.property("warn")) == on:
+            return
+        widget.setProperty("warn", "true" if on else None)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _open_workdir_window(self) -> None:
+        """残留窗口单例；沿用密码库那套 closed 信号清理引用。"""
+        wd = self._effective_workdir()
+        if self._workdir_window is not None and self._workdir_window_dir != wd:
+            # 工作目录被改过：旧窗口盘的是另一个目录，换掉而不是复用
+            self._workdir_window.close()
+        if self._workdir_window is None:
+            self._workdir_window = WorkdirWindow(wd, self._db_path, parent=self)
+            self._workdir_window.cleaned.connect(self._on_residue_cleaned)
+            self._workdir_window.closed.connect(self._on_residue_closed)
+            self._workdir_window_dir = wd
+            self._workdir_window.show()
+        else:
+            self._workdir_window.refresh()
+            self._workdir_window.show()
+            self._workdir_window.raise_()
+            self._workdir_window.activateWindow()
+
+    def _on_residue_cleaned(self, freed: int) -> None:
+        self._refresh_residue()
+        self.statusBar().showMessage(f"已清理工作目录残留，释放 {human_size(freed)}", 8000)
+
+    def _on_residue_closed(self) -> None:
+        self._workdir_window = None
+        self._workdir_window_dir = None
+        self._refresh_residue()
 
     # ---------- 交互 ----------
 
@@ -550,6 +725,16 @@ class SettingsWindow(QMainWindow):
 
     # ---------- 生命周期 ----------
 
+    def showEvent(self, event) -> None:
+        """每次显示都重算残留：窗口开着的时候可能又解压过好几轮。"""
+        self._refresh_residue()
+        super().showEvent(event)
+
     def closeEvent(self, event) -> None:
+        # 残留窗口挂在本窗口下，主窗口关掉设置时它不能变成孤儿
+        if self._workdir_window is not None:
+            self._workdir_window.close()
+            self._workdir_window = None
+            self._workdir_window_dir = None
         self.closed.emit()
         super().closeEvent(event)

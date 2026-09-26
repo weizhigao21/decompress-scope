@@ -7,12 +7,13 @@ core 修得再对也还是同一个坑。所以这里钉的是**呈现**与**入
 - 任务行必须显示「未交付」+ 警示色，而不是跟着 done 显示绿色「完成」；
 - 真实状态与呈现态要分开算：统计卡的「完成」数不能因为改了显示文案就少一个；
 - 交付失败必须弹窗（状态栏一闪而过的提示会被忽略）；
-- 主界面要有常驻的工作目录残留入口——工作目录里的东西全是「成功」状态，
+- 设置里要有工作目录残留入口——工作目录里的东西全是「成功」状态，
   不主动给入口，用户永远不知道自己磁盘被吃了多少；
 - 清理这类**跨 Qt 边界的字节数**不许被 32 位 int 截断：`Signal(int)` 上限 2 GiB，
   越界时 emit 不抛异常、只静默丢信号（详见下面"跨 Qt 边界的数值不许溢出"一节）。
 """
 import re
+import shutil
 import warnings
 from pathlib import Path
 
@@ -20,9 +21,9 @@ import pytest
 
 pytest.importorskip("PySide6", reason="未安装 PySide6，跳过未交付呈现守卫")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QEvent, Qt  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
-from PySide6.QtWidgets import QDialog, QLabel, QSizePolicy  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from ui import theme  # noqa: E402
 
@@ -185,56 +186,117 @@ def test_finished_without_delivery_failure_does_not_popup(app, monkeypatch):
     app.processEvents()
 
 
-# ---------- 工作目录残留入口 ----------
+# ---------- 工作目录残留入口（已从主界面移入设置窗口） ----------
+#
+# 原先这一行常驻主界面底部。现在随其余低频设置一起收进「设置 → 输出位置」，
+# 主界面只留「添加输入 → 开始解压」一条主线。**入口本身必须有**：
+# 工作目录里的东西全是「成功」状态，不给入口就等于让磁盘悄悄被吃掉。
 
 
-def test_workdir_entry_exists_and_stats_line(app):
-    """主界面必须有常驻的工作目录入口 + 残留计数（在「密码库」那一行的上方）。"""
+def _settings(app, tmp_path, **cfg_kw):
+    """按真实启动路径装配设置窗口：窗口显示出来才能做像素断言。"""
+    from core.appconfig import AppConfig
+    from ui.settings_window import SettingsWindow
+
+    win = SettingsWindow(AppConfig(**cfg_kw), tmp_path / "cfg.json", tmp_path,
+                         db_path=tmp_path / "t.db")
+    win.resize(780, 620)
+    win.show()
+    app.processEvents()
+    # offscreen 光标常驻 (10,10)，不清掉悬停态会把悬停色当成常态读
+    QApplication.sendEvent(win, QEvent(QEvent.Type.Leave))
+    app.processEvents()
+    return win
+
+
+def _warm_pixels(img) -> int:
+    """统计明显偏暖的像素。
+
+    WARN(#D29922) 满足 r>150 且 r-b>60；TEXT_FAINT(#5E6773) 的 r 只有 94，
+    一个都命中不了——判据天然分得开这两档，不需要断言"样式表里有某条规则"。
+    """
+    n = 0
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            if c.red() > 150 and c.red() > c.blue() + 60:
+                n += 1
+    return n
+
+
+def test_residue_entry_lives_in_settings(app, tmp_path):
+    """残留入口在设置窗口里，且**不再**留在主界面（搬干净，不是复制一份）。"""
     from ui.main_window import MainWindow
 
-    win = MainWindow()
+    win = _settings(app, tmp_path)
     try:
-        assert win.workdir_label.text() in {"无残留", "0 项残留"} or "残留" in win.workdir_label.text()
-        assert win.workdir_open_btn.property("ghost") == "true"
-        assert not win.workdir_open_btn.property("primary"), "不许再加第二个 primary"
-        # 这行必须像密码库那行一样是 Maximum：否则展开折叠区时会跟任务树抢高度
-        panel = win.workdir_label.parentWidget()
-        assert panel.sizePolicy().verticalPolicy() == QSizePolicy.Maximum
-        # 密码库那行仍在（不是替换关系）
-        assert hasattr(win, "vault_open_btn")
+        assert win.residue_label.text() in {"无残留", "0 项残留"}
+        assert win.residue_open_btn.property("ghost") == "true"
+        assert not win.residue_open_btn.property("primary"), "不许再加第二个 primary"
     finally:
         win.close()
     app.processEvents()
 
+    m = MainWindow()
+    try:
+        assert not hasattr(m, "workdir_open_btn"), "主界面还留着残留入口"
+        assert not hasattr(m, "workdir_label"), "主界面还留着残留计数"
+        # 密码库那行仍在（不是替换关系）
+        assert hasattr(m, "vault_open_btn")
+    finally:
+        m.close()
+    app.processEvents()
 
-def test_workdir_count_reflects_leftover_dirs(app, tmp_path, monkeypatch):
-    """残留计数必须真的反映工作目录里的 task_<id> 目录数。"""
-    from ui import main_window as mw
-    from ui.main_window import MainWindow
 
-    monkeypatch.setattr(mw, "PROJECT_ROOT", tmp_path, raising=False)
+def test_residue_count_reflects_leftover_dirs(app, tmp_path):
+    """残留计数要真的反映工作目录里的 task_<id> 目录数，并有警示色。
+
+    计数与颜色一起断言：只测数字会漏掉"有残留却和「无残留」长得一样"，
+    只测颜色会漏掉"颜色对但数错了"。
+    """
     ws = tmp_path / ".workspace"
     (ws / "task_1").mkdir(parents=True)
     (ws / "task_2").mkdir()
     (ws / "不是我的目录").mkdir()
 
-    win = MainWindow()
+    win = _settings(app, tmp_path)
     try:
-        assert win.workdir_label.text() == "2 项残留"
-        assert win.workdir_label.styleSheet().find(theme.WARN) >= 0, \
-            "有残留时要用警示色，不能跟「无残留」一个样"
+        assert win.residue_label.text() == "2 项残留", win.residue_label.text()
+        img = win.residue_label.grab().toImage()
+        assert img.width() > 8 and img.height() > 8, "没抓到画面，本用例会假绿"
+        assert _warm_pixels(img) >= 20, "有残留时要用警示色，不能和「无残留」一个样"
+
+        shutil.rmtree(ws)
+        win._refresh_residue()
+        app.processEvents()
+        assert win.residue_label.text() == "无残留"
+        assert _warm_pixels(win.residue_label.grab().toImage()) == 0, \
+            "清空后还挂着警示色 = 常驻噪音，会把真危险稀释掉"
     finally:
         win.close()
     app.processEvents()
 
 
-def test_workdir_window_is_singleton(app, tmp_path, monkeypatch):
-    """残留窗口单例复用（沿用密码库窗口的做法）。"""
-    from ui import main_window as mw
-    from ui.main_window import MainWindow
+def test_residue_follows_workdir_field(app, tmp_path):
+    """计数跟着工作目录输入框走：改完路径还没保存，也该显示那个目录的真实情况。"""
+    other = tmp_path / "elsewhere"
+    (other / "task_7").mkdir(parents=True)
+    (tmp_path / ".workspace").mkdir()
 
-    monkeypatch.setattr(mw, "PROJECT_ROOT", tmp_path, raising=False)
-    win = MainWindow()
+    win = _settings(app, tmp_path)
+    try:
+        assert win.residue_label.text() == "无残留"
+        win.workdir_edit.setText(str(other))
+        app.processEvents()
+        assert win.residue_label.text() == "1 项残留", win.residue_label.text()
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_workdir_window_is_singleton(app, tmp_path):
+    """残留窗口单例复用（沿用密码库窗口的做法）。"""
+    win = _settings(app, tmp_path)
     try:
         win._open_workdir_window()
         first = win._workdir_window
@@ -556,24 +618,18 @@ def test_workdir_cleaned_signal_carries_multi_gigabyte_value(app, tmp_path, monk
     app.processEvents()
 
 
-def test_main_window_refreshes_residue_count_after_big_cleanup(app, tmp_path, monkeypatch):
-    """端到端：清理 > 2 GiB 之后，主界面页脚的残留计数必须真的归零。
+def test_residue_count_refreshes_after_big_cleanup(app, tmp_path, monkeypatch):
+    """端到端：清理 > 2 GiB 之后，设置里的残留计数必须真的归零。
 
-    这才是用户看到的现象——点了清理、文件确实没了、但页脚还写着「1 项残留」。
+    这才是用户看到的现象——点了清理、文件确实没了、计数却还写着「1 项残留」。
     上面的单测钉信号宽度，这条钉"接上了没有"。
     """
     from PySide6.QtWidgets import QMessageBox
 
     from core.models import Task, TaskStatus
     from core.store import TaskStore
-    from ui import main_window as mw
-    from ui.main_window import MainWindow
 
-    monkeypatch.setattr(mw, "PROJECT_ROOT", tmp_path, raising=False)
-    monkeypatch.setattr(mw, "CONFIG_PATH", tmp_path / "config.json", raising=False)
     db = tmp_path / "t.db"
-    monkeypatch.setattr(mw, "DEFAULT_DB", db, raising=False)
-
     ws = tmp_path / ".workspace"
     store = TaskStore(db)
     outside = tmp_path / "downloads" / "pack"
@@ -596,15 +652,15 @@ def test_main_window_refreshes_residue_count_after_big_cleanup(app, tmp_path, mo
             real_prune(targets, workdir, allow_unsafe)[0] + _OVER_2GIB, []))
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **kw: QMessageBox.Yes)
 
-    win = MainWindow()
+    win = _settings(app, tmp_path, workdir=str(ws))
     try:
-        assert win.workdir_label.text() == "1 项残留", win.workdir_label.text()
+        assert win.residue_label.text() == "1 项残留", win.residue_label.text()
         win._open_workdir_window()
         win._workdir_window._on_prune()
 
         assert not (ws / f"task_{t.id}").exists(), "前置条件失败：没删到东西"
-        assert win.workdir_label.text() == "无残留", \
-            f"清理后主界面残留计数没刷新：{win.workdir_label.text()!r}"
+        assert win.residue_label.text() == "无残留", \
+            f"清理后残留计数没刷新：{win.residue_label.text()!r}"
     finally:
         win.close()
     app.processEvents()

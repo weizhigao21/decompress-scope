@@ -2,8 +2,9 @@
 
 设计要点：
 - 三段式信息架构：顶部工具条 → 输入/概览 → 任务列表 → 底部状态条
-- 低频参数（深度/上限/来源/开关）默认折叠，保持默认视图安静
-- 底部折叠密码库，待密码任务可一键补录
+- 低频参数一律不在主界面出现：解压深度/上限/密码来源/各类开关全在
+  ui.settings_window 里调（主窗口只读偏好、不改偏好）
+- 底部折叠密码库入口，待密码任务可一键补录
 - 全量操作走主题 QSS，颜色只从 ui.theme 取
 - 用户偏好（输出落点/拖入即开始/完成后开目录）持久化到 config.json，
   主窗口只读不改，改由 ui.settings_window 负责
@@ -14,7 +15,7 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -25,7 +26,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -33,8 +33,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
-    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -54,12 +52,10 @@ from core.appconfig import (
 from core.config import Config
 from core.formatting import human_count, human_size
 from core.vault import PasswordVault
-from core.workdir_cleanup import iter_task_dirs
 from ui import theme
 from ui.settings_window import SettingsWindow
 from ui.vault_window import VaultWindow
 from ui.worker import ExtractWorker
-from ui.workdir_window import WorkdirWindow
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
@@ -226,7 +222,6 @@ class MainWindow(QMainWindow):
         self._stats = {"pending": 0, "done": 0, "needs_password": 0, "failed": 0}
         self._vault_window: VaultWindow | None = None
         self._settings_window: SettingsWindow | None = None
-        self._workdir_window: WorkdirWindow | None = None
         self._cfg = AppConfig.ensure(CONFIG_PATH)
 
         # 拖入即开始的合并窗口：连续拖入多个文件只启动一次
@@ -237,7 +232,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_cfg_to_ui()
         self._refresh_vault_label()
-        self._refresh_workdir_label()
         self._refresh_empty_state()
         self._restore_last_inputs()
 
@@ -246,8 +240,9 @@ class MainWindow(QMainWindow):
     def _apply_cfg_to_ui(self) -> None:
         """把偏好映射到界面。开关控件对用户可见，但不在此处触发任何解压。
 
-        折叠区的高级参数也从偏好初始化——它既是「本次覆盖」入口，也是偏好的
-        可视化。若不同步，用户会看到与实际生效值不符的数字。
+        这里只同步「主界面确实展示」的那几项；解压深度/上限/密码来源/各类开关
+        全部住在设置窗口，主窗口不再复刻一遍——同一个值有两处入口，迟早会
+        出现"界面上显示 50、实际生效 3"这种对不上的情况。
         """
         cfg = self._cfg
         self.auto_run.setChecked(cfg.autorun_mode != AUTORUN_OFF)
@@ -255,12 +250,6 @@ class MainWindow(QMainWindow):
         self.auto_open.setToolTip(
             "完成后打开解压结果所在目录" if cfg.open_after == OPEN_PATHS
             else "完成后打开隔离工作目录")
-
-        self.depth_spin.setValue(cfg.max_depth)
-        self.total_spin.setValue(cfg.max_total_gb)
-        self.sniff.setChecked(cfg.sniff_archives)
-        self.keep_intermediate.setChecked(not cfg.delete_intermediate)
-        self.delete_original.setChecked(not cfg.keep_original)
 
     def _save_cfg(self) -> None:
         try:
@@ -286,7 +275,7 @@ class MainWindow(QMainWindow):
         """设置窗口单例；沿用与密码库相同的 closed 信号清理手法。"""
         if self._settings_window is None:
             self._settings_window = SettingsWindow(
-                self._cfg, CONFIG_PATH, PROJECT_ROOT, parent=self)
+                self._cfg, CONFIG_PATH, PROJECT_ROOT, db_path=DEFAULT_DB, parent=self)
             self._settings_window.saved.connect(self._on_settings_saved)
             self._settings_window.closed.connect(self._on_settings_closed)
             self._settings_window.show()
@@ -314,9 +303,7 @@ class MainWindow(QMainWindow):
         input_area.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         root.addWidget(input_area)
         root.addWidget(self._build_action_bar())
-        root.addWidget(self._build_params_panel())
         root.addWidget(self._build_tree(), stretch=1)
-        root.addWidget(self._build_workdir_panel())
         root.addWidget(self._build_vault_panel())
 
         self.statusBar().showMessage("就绪")
@@ -493,91 +480,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.open_dir_btn)
         return wrapper
 
-    def _build_params_panel(self) -> QWidget:
-        wrapper = QWidget()
-        wrapper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        box = QVBoxLayout(wrapper)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(6)
-
-        self.params_toggle = QToolButton()
-        self.params_toggle.setProperty("section", "true")
-        self.params_toggle.setText("高级参数")
-        self.params_toggle.setCheckable(True)
-        self.params_toggle.setChecked(False)
-        self.params_toggle.setCursor(Qt.PointingHandCursor)
-        self.params_toggle.setToolTip("解压深度、大小上限、密码来源等默认值已够用")
-        box.addWidget(self.params_toggle)
-
-        self.params_body = QFrame()
-        self.params_body.setProperty("panel", "true")
-        self.params_body.setVisible(False)
-        body = QHBoxLayout(self.params_body)
-        body.setContentsMargins(14, 12, 14, 12)
-        body.setSpacing(18)
-
-        body.addWidget(self._labeled("密码来源", self._make_source_edit(), 0))
-        body.addWidget(self._labeled("最大深度", self._make_depth_spin(), 0))
-        body.addWidget(self._labeled("大小上限 GB", self._make_total_spin(), 0))
-
-        checks = QVBoxLayout()
-        checks.setSpacing(4)
-        self.keep_intermediate = QCheckBox("保留中间层压缩包")
-        self.delete_original = QCheckBox("完成后删除原件")
-        self.sniff = QCheckBox("文件头嗅探伪装包")
-        self.sniff.setChecked(True)
-        self.sniff.setToolTip("扩展名不认识时读 magic bytes 判断是否为压缩包")
-        checks.addWidget(self.keep_intermediate)
-        checks.addWidget(self.delete_original)
-        checks.addWidget(self.sniff)
-        checks_wrap = QWidget()
-        checks_wrap.setLayout(checks)
-        body.addWidget(checks_wrap)
-        body.addStretch(1)
-
-        box.addWidget(self.params_body)
-        self.params_toggle.toggled.connect(self._on_params_toggled)
-        return wrapper
-
-    def _labeled(self, text: str, widget: QWidget, width: int) -> QWidget:
-        wrap = QWidget()
-        col = QVBoxLayout(wrap)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(4)
-        label = QLabel(text)
-        label.setStyleSheet(f"color: {theme.TEXT_FAINT}; background: transparent; font-size: 12px;")
-        col.addWidget(label)
-        if width:
-            widget.setFixedWidth(width)
-        col.addWidget(widget)
-        return wrap
-
-    def _make_source_edit(self) -> QLineEdit:
-        self.source_edit = QLineEdit()
-        self.source_edit.setPlaceholderText("留空则从文件名识别")
-        self.source_edit.setMinimumWidth(180)
-        # QLineEdit 默认吃拖放（把文件路径当文本插入）。放行给窗口，
-        # 否则拖到这一条上既不加入输入、又冒出一串乱码路径。
-        self.source_edit.setAcceptDrops(False)
-        return self.source_edit
-
-    def _make_depth_spin(self) -> QSpinBox:
-        self.depth_spin = QSpinBox()
-        self.depth_spin.setRange(1, 10)
-        self.depth_spin.setValue(5)
-        self.depth_spin.setFixedWidth(70)
-        self.depth_spin.setAcceptDrops(False)
-        return self.depth_spin
-
-    def _make_total_spin(self) -> QSpinBox:
-        self.total_spin = QSpinBox()
-        self.total_spin.setRange(1, 2000)
-        self.total_spin.setValue(50)
-        self.total_spin.setFixedWidth(90)
-        self.total_spin.setToolTip("解压后总大小超过此值将拒绝（防 zip 炸弹）")
-        self.total_spin.setAcceptDrops(False)
-        return self.total_spin
-
     def _build_tree(self) -> QWidget:
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(
@@ -602,73 +504,6 @@ class MainWindow(QMainWindow):
             f"QTreeWidget::branch {{ background: transparent; }}"
         )
         return self.tree
-
-    def _build_workdir_panel(self) -> QWidget:
-        """工作目录残留入口：一行 = 标题 + 残留项数 + 「查看/清理」按钮。
-
-        为什么要在主界面常驻一行：工作目录里的东西**全都**是「解压成功」状态
-        （库里 done、任务树显示"完成"），用户没有任何线索知道磁盘被吃了多少，
-        也没有入口清掉。5.38 GB 就是这么静静躺着的。
-
-        计数只用一层 iterdir，绝不递归统计大小——常驻控件不能为了一个数字去走
-        几十万个文件，那样开窗就会卡住。真实占用在弹窗里点开才算。
-        """
-        wrapper = QWidget()
-        wrapper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        row = QHBoxLayout(wrapper)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        title = QLabel("工作目录")
-        title.setStyleSheet(f"color: {theme.TEXT}; background: transparent; font-weight: 500;")
-        row.addWidget(title)
-
-        self.workdir_label = QLabel("")
-        self.workdir_label.setStyleSheet(
-            f"color: {theme.TEXT_FAINT}; background: transparent;")
-        row.addWidget(self.workdir_label)
-
-        row.addStretch(1)
-
-        self.workdir_open_btn = QPushButton("查看/清理")
-        self.workdir_open_btn.setProperty("ghost", "true")
-        self.workdir_open_btn.setCursor(Qt.PointingHandCursor)
-        self.workdir_open_btn.setToolTip("盘点隔离工作目录里的残留产物，确认后清理")
-        self.workdir_open_btn.clicked.connect(self._open_workdir_window)
-        row.addWidget(self.workdir_open_btn)
-        return wrapper
-
-    def _refresh_workdir_label(self) -> None:
-        try:
-            n = len(iter_task_dirs(self._cfg.resolve_workdir(PROJECT_ROOT)))
-        except OSError:
-            n = 0
-        self.workdir_label.setText(f"{n} 项残留" if n else "无残留")
-        color = theme.WARN if n else theme.TEXT_FAINT
-        self.workdir_label.setStyleSheet(f"color: {color}; background: transparent;")
-
-    def _open_workdir_window(self) -> None:
-        """残留窗口单例；复用密码库那套 closed 信号清理引用。"""
-        if self._workdir_window is None:
-            self._workdir_window = WorkdirWindow(
-                self._cfg.resolve_workdir(PROJECT_ROOT), DEFAULT_DB, parent=self)
-            self._workdir_window.cleaned.connect(self._on_workdir_cleaned)
-            self._workdir_window.closed.connect(self._on_workdir_closed)
-            self._workdir_window.show()
-        else:
-            self._workdir_window.refresh()
-            self._workdir_window.show()
-            self._workdir_window.raise_()
-            self._workdir_window.activateWindow()
-
-    def _on_workdir_cleaned(self, freed: int) -> None:
-        self._refresh_workdir_label()
-        self.statusBar().showMessage(
-            f"已清理工作目录残留，释放 {human_size(freed)}", 8000)
-
-    def _on_workdir_closed(self) -> None:
-        self._workdir_window = None
-        self._refresh_workdir_label()
 
     def _build_vault_panel(self) -> QWidget:
         """密码库入口：一行 = 标题 + 计数 + 「打开密码库」按钮。
@@ -697,12 +532,6 @@ class MainWindow(QMainWindow):
         self.vault_open_btn.clicked.connect(self._open_vault_window)
         row.addWidget(self.vault_open_btn)
         return wrapper
-
-    # ---------- 折叠交互 ----------
-
-    def _on_params_toggled(self, on: bool) -> None:
-        self.params_body.setVisible(on)
-        self.params_toggle.setText(("收起高级参数" if on else "高级参数"))
 
     # ---------- 拖放：窗口整体是拖放目标 ----------
     #
@@ -848,17 +677,13 @@ class MainWindow(QMainWindow):
                 f"已打开前 5 个结果目录（共 {len(existing)} 个）", 8000)
 
     def _make_cfg(self) -> Config:
-        """单次运行参数：从偏好派生，再叠加折叠区里临时改过的高级参数。
+        """单次运行参数：全部由偏好派生，主窗口不做任何"本次覆盖"。
 
-        折叠区是「本次覆盖」，不写回配置——用户调完不用怕污染长期偏好。
+        偏好是唯一真相源（见 core/appconfig.py）：想在这一次跑得不一样，
+        去设置里改，改完就是新的长期偏好。曾经折叠区里那一份"本次覆盖"
+        与设置在界面上各显示一个值，两边一旦不同步就没人说得清哪个在生效。
         """
-        overrides = self._cfg.as_overrides(PROJECT_ROOT)
-        overrides["max_depth"] = self.depth_spin.value()
-        overrides["max_total_uncompressed"] = self.total_spin.value() * (1024 ** 3)
-        overrides["delete_intermediate"] = not self.keep_intermediate.isChecked()
-        overrides["keep_original"] = not self.delete_original.isChecked()
-        overrides["sniff_archives"] = self.sniff.isChecked()
-        return Config.create(**overrides)
+        return Config.create(**self._cfg.as_overrides(PROJECT_ROOT))
 
     # ---------- 运行 ----------
 
@@ -883,7 +708,7 @@ class MainWindow(QMainWindow):
         self._cancel.clear()
         self._thread = QThread()
         self._worker = ExtractWorker(cfg, DEFAULT_DB, inputs,
-                                     source=self.source_edit.text().strip(),
+                                     source=self._cfg.password_source,
                                      cancel=self._cancel,
                                      output_mode=self._cfg.output_mode,
                                      subdir_name=self._cfg.subdir_name,
@@ -1107,14 +932,13 @@ class MainWindow(QMainWindow):
                 f"{delivery_failed} 个包**已经解压成功**，但产物没能交付到目标位置，"
                 f"现在仍留在隔离工作目录里：\n\n{names}{more}\n\n"
                 f"原因：{first}\n\n"
-                f"这些任务在列表里标为「未交付」。可以到下方「工作目录 → 查看/清理」"
-                f"里查看它们占了多少空间。",
+                f"这些任务在列表里标为「未交付」。可以到「设置 → 输出位置」里"
+                f"点「查看/清理」看它们占了多少空间。",
             )
         if report.warnings:
             # 复制失败/同名避让这类非致命问题只提示，不打断
             self.statusBar().showMessage(f"注意：{report.warnings[0]}", 10000)
         self._refresh_vault_label()
-        self._refresh_workdir_label()
 
     def _on_failed(self, message: str) -> None:
         self.start_btn.setEnabled(True)

@@ -51,23 +51,28 @@ def test_empty_state_placeholder(app):
     app.processEvents()
 
 
-def test_fold_panels_collapsed_by_default(app):
-    """极简取向：高级参数默认折叠；密码库已降级为「打开密码库」按钮。"""
+def test_advanced_params_live_in_settings_not_main_window(app):
+    """极简取向：高级参数与工作目录残留**整块**搬进了设置窗口。
+
+    这两块原先在主界面上（一个默认折叠的「高级参数」面板 + 一行残留入口）。
+    主界面只留「添加输入 → 开始解压」一条主线；深度/上限/密码来源/各类开关
+    以及残留盘点入口都住在 ui.settings_window 里。
+
+    属性名一并钉住：同名控件留在主窗口就等于"搬了但没搬干净"，而两处都能改
+    的话迟早出现"显示 50、实际 3"。设置窗口侧的存在性由 test_ui_settings 守。
+    """
     from ui.main_window import MainWindow
 
     win = MainWindow()
     try:
-        # 窗口未 show 时 isVisible() 恒 False，须用 isVisibleTo / 初始 check 态判断
-        assert win.params_body.isVisibleTo(win) is False
-        assert win.params_toggle.isChecked() is False
+        for gone in ("params_body", "params_toggle", "source_edit", "depth_spin",
+                     "total_spin", "sniff", "keep_intermediate", "delete_original",
+                     "workdir_label", "workdir_open_btn"):
+            assert not hasattr(win, gone), f"主界面仍残留 {gone}，应已移入设置窗口"
         # 密码库折叠体已移除，改为独立窗口入口按钮（ghost）
         assert not hasattr(win, "vault_body")
         assert hasattr(win, "vault_open_btn")
         assert win.vault_open_btn.property("ghost") == "true"
-        win.params_toggle.setChecked(True)
-        app.processEvents()
-        assert win.params_body.isVisibleTo(win) is True
-        assert "高级参数" in win.params_toggle.text()
     finally:
         win.close()
     app.processEvents()

@@ -274,7 +274,12 @@ class Pipeline:
             self._set(task, TaskStatus.FAILED)
             return
 
-        vault_candidates = self.vault.candidates_for(task.source, limit=20)
+        # 库的取用配额**必须**取自 max_password_attempts，不能在这里写死。
+        # 写死 20 会让设置项说谎：用户把它从 20 调到 200，库里能进来的仍然只有
+        # 那 20 条，调整完全不生效。候选的最终截断在下一行的 [:...] 完成。
+        vault_candidates = self.vault.candidates_for(
+            task.source, limit=self.cfg.max_password_attempts
+        )
         candidates = build_candidates(
             archive.name, task.source, vault_candidates
         )[: self.cfg.max_password_attempts]

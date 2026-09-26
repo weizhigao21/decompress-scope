@@ -238,6 +238,41 @@ def test_source_password_found_when_vault_saturated(tmp_path):
     assert report.needs_password == 0
 
 
+def test_candidate_budget_follows_setting_and_reaches_other_sources(tmp_path):
+    """端到端：候选配额必须真的跟随 max_password_attempts，且跨来源条目要能轮到。
+
+    构造：库里 25 条无来源的历史密码 + 1 条记在**别的站点**名下的正确密码，
+    包的密码就是后者。按优先级它排在第 26 位。
+
+    - 配额 20：连「无来源」那一段都装不下，必然解不出（顺带钉住"不会无脑全试"）。
+    - 配额 40：正确密码进入候选 → 解出。
+
+    旧实现两条都过不去：`candidates_for(…, limit=20)` 把库配额硬编码成 20，
+    而且只查 `source=?` 与 `source=''`，跨来源的正确密码根本不在候选里。
+    用户表现为「设置里明明调到 40 了，还是报需要密码」——设置项说谎。
+    """
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    for i in range(25):
+        vault.add_manual(f"stale{i:02d}")            # 无来源：排在第二档
+    vault.add_manual("target_pw", "other-site.com")  # 跨来源：排在第三档
+
+    (inputs / "a.txt").write_text("x", encoding="utf-8")
+    _run7z(exe, ["a", "-ptarget_pw", "pack.zip", "a.txt"], inputs)
+    # 先建包再改名：7z 的通配符会把方括号文件名当模式解析
+    (inputs / "pack.zip").rename(inputs / "pack[wnacg.com].zip")
+
+    cfg.max_password_attempts = 20
+    assert pipe.run([inputs]).needs_password == 1, \
+        "配额 20 时装不下第 26 位的候选，此处就该解不出"
+
+    cfg.max_password_attempts = 40
+    report = pipe.run([inputs])
+    assert report.failed == 0
+    assert report.done == 1, \
+        "配额放开后跨来源的正确密码仍未进入候选——配额跟随设置 + 跨来源检索两者有一条没生效"
+    assert report.needs_password == 0
+
+
 def test_encrypted_bomb_rejected(tmp_path):
     """P0-1 回归：头部加密的包（-mhe=on）在空密码下探不到解压后大小。
 

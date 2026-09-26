@@ -51,6 +51,13 @@ def test_settings_window_smoke(app, tmp_path):
         assert win.timeout_spin.value() == 3600
         # 删原件默认不开
         assert win.delete_orig_check.isChecked() is False
+        # 密码来源默认空（= 每个包从文件名识别）；主界面搬来的两项在这里
+        assert win.source_edit.text() == ""
+        assert win.attempts_spin.value() == 20
+        # 工作目录残留入口也在设置里
+        assert win.residue_label.text() in {"无残留", "0 项残留"}
+        assert win.residue_open_btn.property("ghost") == "true"
+        assert not win.residue_open_btn.property("primary"), "不许有第二个 primary"
     finally:
         win.close()
     app.processEvents()
@@ -73,6 +80,7 @@ def test_settings_collect_roundtrip(app, tmp_path):
         win.delete_orig_check.setChecked(True)
         win.skip_done_check.setChecked(False)
         win.timeout_spin.setValue(7200)
+        win.source_edit.setText("  example.com  ")
 
         cfg = win._collect()
         assert cfg.output_mode == OUTPUT_WORKDIR
@@ -85,6 +93,7 @@ def test_settings_collect_roundtrip(app, tmp_path):
         assert cfg.keep_original is False
         assert cfg.skip_done is False
         assert cfg.extract_timeout == 7200
+        assert cfg.password_source == "example.com", "来源两端空白应被规范化掉"
     finally:
         win.close()
     app.processEvents()
@@ -187,6 +196,92 @@ def test_settings_hint_switches_with_mode(app, tmp_path):
         win.output_combo.setCurrentIndex(win.output_combo.findData(OUTPUT_SAMEDIR))
         app.processEvents()
         assert "所在目录" in win.output_hint.text()
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_numeric_control_ranges_come_from_core_bounds(app, tmp_path):
+    """数字框的范围只能来自 core/appconfig 的边界，不许在 UI 里另写一份。
+
+    症状级理由：范围被写死成两份时，其中一份迟早改不到。用户会遇到"控件明明
+    能调上去、一保存却被夹回来"的鬼打墙——输入被静默吞掉，而且从界面上完全
+    看不出是谁夹的（`AppConfig.normalize()` 在加载和保存前都会跑一次，
+    连手改 config.json 都会被打回）。
+    """
+    from core.appconfig import clamp_bounds
+    from ui.settings_window import SettingsWindow
+
+    win = SettingsWindow(_cfg(), tmp_path / "cfg.json", tmp_path)
+    try:
+        pairs = (
+            ("max_depth", win.depth_spin),
+            ("max_total_gb", win.total_spin),
+            ("max_ratio", win.ratio_spin),
+            ("max_password_attempts", win.attempts_spin),
+            ("recent_inputs_limit", win.recent_spin),
+            ("session_days", win.keep_days_spin),
+            ("extract_timeout", win.timeout_spin),
+        )
+        for name, widget in pairs:
+            lo, hi = clamp_bounds(name)
+            assert (widget.minimum(), widget.maximum()) == (lo, hi), (
+                f"{name} 的控件范围 {widget.minimum()}–{widget.maximum()} 与 core 的 "
+                f"{lo}–{hi} 不一致。范围只能有一份定义，否则用户会被夹在中间")
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_attempts_can_go_past_200_and_survives_save(app, tmp_path):
+    """症状级回归：「密码尝试」调到 200 以上必须真的存得住。
+
+    旧实现把上限写死成 200（UI 的 setRange 与 core 的 _CLAMP 各一份），用户想把
+    整个密码库都试一遍时，输入会被无声夹回 200 —— 表现就是"这个数字改不动"。
+    这里钉的是用户真正在做的动作：调大、保存、再读回来。
+    """
+    from core.appconfig import AppConfig
+    from ui.settings_window import SettingsWindow
+
+    cfg_path = tmp_path / "cfg.json"
+    AppConfig().save(cfg_path)
+    win = SettingsWindow(AppConfig.ensure(cfg_path), cfg_path, tmp_path,
+                         db_path=tmp_path / "t.db")
+    try:
+        win.attempts_spin.setValue(500)
+        assert win.attempts_spin.value() == 500, "控件把大于 200 的输入夹回去了"
+        # 必须能穿到 pipeline 真正消费的那份 Config，而不只是停在界面上
+        assert win._collect().as_overrides(tmp_path)["max_password_attempts"] == 500
+        win._on_save()
+    finally:
+        win.close()
+    app.processEvents()
+
+    assert AppConfig.ensure(cfg_path).max_password_attempts == 500, \
+        "存盘时被 normalize() 夹回去了"
+
+
+def test_attempts_hint_shows_worst_case_cost(app, tmp_path):
+    """控件下方必须实时显示"这个数字意味着等多久"。
+
+    上限从 200 放开到 2000 之后，没有这行提示，用户会毫无察觉地把单个包的等待
+    时间设成几十秒，然后以为程序卡死了。断言跟着 `_MS_PER_CANDIDATE` 算，
+    不写死秒数——否则这条测试会随实测值一起过期。
+    """
+    from ui.settings_window import _MS_PER_CANDIDATE, SettingsWindow
+
+    win = SettingsWindow(_cfg(), tmp_path / "cfg.json", tmp_path)
+    try:
+        n = 1000
+        win.attempts_spin.setValue(n)
+        app.processEvents()
+        expected = f"{n * _MS_PER_CANDIDATE / 1000:.1f} 秒"
+        assert expected in win.attempts_hint.text(), (
+            f"提示没跟上控件值：期望含 {expected!r}，实际 {win.attempts_hint.text()!r}")
+        # 改回小值也要跟着变（不是一次性渲染）
+        win.attempts_spin.setValue(20)
+        app.processEvents()
+        assert "0.4 秒" in win.attempts_hint.text()
     finally:
         win.close()
     app.processEvents()
@@ -419,7 +514,12 @@ def test_settings_window_is_singleton_and_reopenable(app, tmp_path):
 
 
 def test_make_cfg_uses_preferences(app, tmp_path):
-    """_make_cfg 把偏好映射为本次运行参数（GB→字节、开关透传）。"""
+    """_make_cfg 把偏好映射为本次运行参数（GB→字节、开关透传）。
+
+    主界面**没有**任何"本次覆盖"了：想这一次跑得不一样就去设置里改。所以这里
+    断言的是"偏好是什么，本次运行参数就是什么"——多加一条本地覆盖会让设置
+    窗口的显示与实际生效值分家。
+    """
     from core.appconfig import AUTORUN_OFF, OUTPUT_SAMEDIR, AppConfig
     from ui import main_window
     from ui.main_window import MainWindow
@@ -431,12 +531,62 @@ def test_make_cfg_uses_preferences(app, tmp_path):
     try:
         cfg = win._make_cfg()
         assert cfg.max_total_uncompressed == 3 * (1024 ** 3)
-        # 新暴露的两项也必须真的流进本次运行参数，否则设置窗口就是个装饰
+        # 这几项也必须真的流进本次运行参数，否则设置窗口就是个装饰
         assert cfg.extract_timeout == 1800
         assert cfg.skip_done is False
-        # 折叠区控件覆盖偏好
-        win.total_spin.setValue(9)
-        assert win._make_cfg().max_total_uncompressed == 9 * (1024 ** 3)
+        # 主界面不再持有可覆盖偏好的控件
+        assert not hasattr(win, "total_spin"), "主界面不该再有大小上限的本地覆盖"
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_start_passes_password_source_to_worker(app, tmp_path, monkeypatch):
+    """密码来源必须真的流到工作线程。
+
+    只断言"设置窗口收集到了这个字段"证明不了接线：字段可以存进配置、然后被
+    启动路径忽略。用假线程 + 假 worker 拦下构造参数，断言真正传下去的值。
+    """
+    from PySide6.QtCore import QObject, QThread
+    from PySide6.QtCore import Signal as QSignal
+
+    from core.appconfig import AUTORUN_OFF, AppConfig
+    from ui import main_window as mw
+
+    AppConfig(autorun_mode=AUTORUN_OFF, password_source="mydomain.com").save(mw.CONFIG_PATH)
+    seen: dict = {}
+
+    class FakeWorker(QObject):
+        task_event = QSignal(dict)
+        need_password = QSignal(dict)
+        finished_ok = QSignal(object)
+        failed = QSignal(str)
+
+        def __init__(self, cfg, db, inputs, **kw):
+            super().__init__()
+            seen.update(kw)
+            seen["inputs"] = list(inputs)
+
+        def run(self) -> None:      # 不真跑解压
+            pass
+
+    class FakeThread(QThread):
+        """真 QThread 的子类（moveToThread 会做类型检查），只是不起线程。"""
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(mw, "ExtractWorker", FakeWorker)
+    monkeypatch.setattr(mw, "QThread", FakeThread)
+
+    win = mw.MainWindow()
+    try:
+        f = tmp_path / "a.zip"
+        f.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+        win.input_list.add_paths([str(f)])
+        win._start()
+        assert seen.get("source") == "mydomain.com", \
+            f"密码来源没传到工作线程：{seen.get('source')!r}"
     finally:
         win.close()
     app.processEvents()

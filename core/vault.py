@@ -1,5 +1,8 @@
 """密码库：SQLite 存储，按来源分组记录成功密码与命中次数。
 
+注意「分组存储」≠「分组检索」：来源只用于**排序**（同来源优先），
+`candidates_for()` 会把全库都纳入候选，不隔离任何来源。
+
 分层约定（见 docs/vault-window-design.md §8）：
 - core 层零 Qt 依赖，方法返回 Python 原生类型 / frozen dataclass。
 - 依赖方向单向：ui/* → core/*。
@@ -30,6 +33,11 @@ _ORDER_COLUMNS: dict[str, str] = {
     "recent": "last_hit_at",
     "password": "password",
 }
+
+# candidates_for() 的单次扫描上限。排序后前 N 条已远超任何实际用得到的配额
+# （max_password_attempts 的上限是 200），但能挡住"把十万行字典灌进库"这种
+# 让每个加密包都去拉全表的情形。去重与 limit 都在这批之内进行。
+_SCAN_CAP = 2000
 
 
 @dataclass(frozen=True)
@@ -71,7 +79,8 @@ class PasswordVault:
     def close(self) -> None:
         self.conn.close()
 
-    # ---------- 冻结区（现有，签名与行为不得改动） ----------
+    # ---------- 冻结区（签名稳定；candidates_for 的检索范围于 2026-09-26 放宽，
+    #            理由见其 docstring，勿按"只查同来源"的旧印象改回去） ----------
 
     def record_success(self, password: str, source: str = "") -> None:
         """解压成功后回写：命中次数 +1，无则新建。"""
@@ -93,30 +102,40 @@ class PasswordVault:
         )
         self.conn.commit()
 
-    def candidates_for(self, source: str = "", limit: int = 50) -> list[str]:
-        """候选密码：同来源按命中排序在前，全局命中排序在后，去重保序。"""
-        cur = self.conn.cursor()
-        rows: list[str] = []
-        if source:
-            cur.execute(
-                "SELECT password FROM passwords WHERE source=?"
-                " ORDER BY hit_count DESC, last_hit_at DESC LIMIT ?",
-                (source, limit),
-            )
-            rows.extend(r[0] for r in cur.fetchall())
-        cur.execute(
-            "SELECT password FROM passwords WHERE source=''"
-            " ORDER BY hit_count DESC, last_hit_at DESC LIMIT ?",
-            (limit,),
+    def candidates_for(self, source: str = "", limit: int = 0) -> list[str]:
+        """候选密码：同来源 → 无来源 → 其他来源，段内按命中排序，去重保序。
+
+        `limit` 沿用 `query()` 的约定：0 = 不限，正数 = 取前 N 条。
+        截断发生在**排序与去重之后**，所以高优先级段不会被低优先级段挤掉。
+
+        为什么是三段而不是简单按 hit_count 全局排：密码库是"我自己试通过什么"
+        的历史，站点归属不是租户边界，但"属于另一个站点"与"没有站点归属"确实
+        不是同一件事——后者多为手工录入、或来自文件名里读不出域名的包，属于
+        通用密码，在无法判断时更值得先试。
+
+        为什么不再只查 `source=?` 与 `source=''`：`record_success` 是按
+        `extract_source(文件名)` 写入的，旧实现让每个来源各自成岛，跨来源的条目
+        **永远不会被试**；文件名里带域名的包越多，盲区越大。而同一个发布者批量
+        打包、或用户复用同一密码时，跨来源命中是常态。
+        """
+        cur = self.conn.execute(
+            """SELECT password FROM passwords
+                ORDER BY CASE WHEN source = ? THEN 0
+                              WHEN source = '' THEN 1
+                              ELSE 2 END ASC,
+                         hit_count DESC,
+                         last_hit_at DESC
+                LIMIT ?""",
+            (source, _SCAN_CAP),
         )
-        rows.extend(r[0] for r in cur.fetchall())
         seen: set[str] = set()
         ordered: list[str] = []
-        for pwd in rows:
-            if pwd.lower() not in seen:
-                seen.add(pwd.lower())
+        for (pwd,) in cur.fetchall():
+            key = pwd.lower()
+            if key not in seen:
+                seen.add(key)
                 ordered.append(pwd)
-        return ordered
+        return ordered[:limit] if limit > 0 else ordered
 
     def list_all(self) -> list[tuple[str, str, int, str | None]]:
         cur = self.conn.execute(

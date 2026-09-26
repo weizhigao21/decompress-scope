@@ -70,10 +70,12 @@ def build_candidates(archive_name: str, source: str, vault_candidates: list[str]
     顺序即优先级，且**必须在调用方截断之前**就排好：
         文件名/提示 → 来源域名派生 → 密码库命中 → 内置字典
 
-    来源派生之所以要排在密码库之前：调用方会做 `[:max_password_attempts]` 截断
-    （默认 20），而 `vault.candidates_for()` 本身最多就返回 20 条。若库排在前，
-    库一满就吃光全部配额，"拿站点域名当密码"这类高命中率候选永远轮不到。
-    库内条目已按 hit_count 排序，同类命中仍然优先于内置字典。
+    来源派生之所以要排在密码库之前：调用方会做 `[:max_password_attempts]` 截断，
+    而库候选的配额同样取自这个上限——库大时它会占满整个列表。若库排在前，
+    「文件名提示」与「来源派生」这两类**这个包特有的线索**就会被通用猜测挤出，
+    而它们恰恰是命中率最高的一档。
+    库内条目已按「同来源 → 无来源 → 其他来源」分档、档内按 hit_count 排序
+    （见 `PasswordVault.candidates_for`），同类命中仍然优先于内置字典。
     """
     candidates: list[str] = []
     seen: set[str] = set()

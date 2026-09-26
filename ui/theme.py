@@ -336,6 +336,12 @@ QLabel[role="pageDesc"], QLabel[role="hint"] {{
 }}
 QLabel[role="fieldLabel"] {{ background: transparent; color: {TEXT_MUTED}; }}
 
+/* 工作目录残留计数：有残留才用警示色。
+   与「危险开关」同一条原则——常驻的警示色会把真正的危险稀释成"又一个彩色文字"。
+   属性随状态切换，切完必须重新 polish（见 SettingsWindow._set_warn）。 */
+QLabel[role="residue"] {{ background: transparent; color: {TEXT_FAINT}; }}
+QLabel[role="residue"][warn="true"] {{ background: transparent; color: {WARN}; }}
+
 /* ===== 列表 / 树 ===== */
 QListWidget, QTreeWidget, QTreeView {{
     background-color: {SURFACE};

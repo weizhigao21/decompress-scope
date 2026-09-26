@@ -107,7 +107,7 @@ def test_clamp_out_of_range(tmp_path):
     assert cfg.max_depth == 10
     assert cfg.max_total_gb == 1
     assert cfg.max_ratio == 1.0
-    assert cfg.max_password_attempts == 200
+    assert cfg.max_password_attempts == 2000
     assert cfg.autorun_delay_ms == 0
 
 
