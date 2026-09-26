@@ -67,12 +67,16 @@ def test_samedir_force_new_ignores_overwrite_flag(tmp_path):
 
 
 def test_nested_task_always_stays_in_workdir(tmp_path):
-    """嵌套（内层）压缩包是中间产物，任何模式都必须留在 workdir 内。"""
+    """嵌套（内层）压缩包是中间产物，任何模式都必须留在 workdir 内。
+
+    out_dir 的**末级**是包名目录（不变式：每个任务的产物目录都叫自己的包名），
+    交付时整目录搬到父产物的对应位置，包名因此在产物里留下一级目录。
+    """
     cfg = _cfg(tmp_path)
     inner = _task(tmp_path, "inner.zip", depth=1, tid=9)
     for mode in (OUTPUT_SAMEDIR, OUTPUT_WORKDIR):
         plan = plan_output(inner, cfg, mode)
-        assert plan.out_dir == cfg.workdir / "task_9" / "out"
+        assert plan.out_dir == cfg.workdir / "task_9" / "out" / "inner"
         assert plan.final_dir is None
         assert plan.copy_back is False
 
@@ -81,7 +85,7 @@ def test_workdir_mode_copies_back_to_source_dir(tmp_path):
     """workdir 模式：隔离解压，但成功后要复制回源压缩包目录。"""
     cfg = _cfg(tmp_path)
     plan = plan_output(_task(tmp_path, "pack.zip"), cfg, OUTPUT_WORKDIR)
-    assert plan.out_dir == cfg.workdir / "task_1" / "out"
+    assert plan.out_dir == cfg.workdir / "task_1" / "out" / "pack"
     assert plan.final_dir == tmp_path / "src" / "_解压开镜" / "pack"
     assert plan.copy_back is True
 
@@ -140,6 +144,24 @@ def test_archive_without_suffix_uses_stem(tmp_path):
     assert plan.out_dir.name == "noext"
 
 
+def test_archive_stem_used_as_dirname_is_sanitized(tmp_path):
+    """包名当目录名前必须消毒：`...zip` 的 stem 正好是 ".."。
+
+    拼出来是 `<源目录>/_解压开镜/..` —— 路径 normalize 后就是用户源目录本身，
+    产物会被平铺进下载目录（与盘符逃逸同族：都是把外部字符串直接当路径成分）。
+    """
+    cfg = _cfg(tmp_path)
+    src = tmp_path / "src"
+    for name in ("...zip", "..zip", "..."):
+        plan = plan_output(_task(tmp_path, name), cfg, OUTPUT_SAMEDIR)
+        assert plan.out_dir.parent == src / "_解压开镜", (
+            f"{name!r} 逃出了容器目录：{plan.out_dir}"
+        )
+        assert plan.out_dir.name not in (".", ".."), f"{name!r} 产生了相对目录名"
+    # 普通包名不受影响
+    assert plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR).out_dir.name == "comic"
+
+
 def test_plan_is_pure_no_side_effects(tmp_path):
     """决策函数不得创建任何目录（只有状态判定与路径拼装）。"""
     cfg = _cfg(tmp_path)
@@ -153,12 +175,34 @@ def test_workdir_mode_without_copy_back_is_pure_isolation(tmp_path):
     """copy_back=False：纯隔离，源目录完全不被动过。
 
     这是 --workdir-only 的语义——用户明确要求「别碰我的下载目录」。
+    工作目录里的产物同样带着包名，用户去翻时能认出哪个目录对应哪个包。
     """
     cfg = _cfg(tmp_path)
     plan = plan_output(_task(tmp_path), cfg, OUTPUT_WORKDIR, copy_back=False)
-    assert plan.out_dir == cfg.workdir / "task_1" / "out"
+    assert plan.out_dir == cfg.workdir / "task_1" / "out" / "pack"
     assert plan.final_dir is None
     assert plan.copy_back is False
+
+
+def test_output_dir_always_named_after_its_own_archive(tmp_path):
+    """不变式：`plan.out_dir.name` 恒等于该包的目录名（任何模式、任何深度）。
+
+    这是「保留包名与层级」的地基——交付阶段正是靠「把 out_dir 整目录搬到父产物
+    里」实现层级的；若 out_dir 不叫包名，搬过去就带上了错误的名字。
+    """
+    from core.output_plan import archive_dir_name
+
+    cfg = _cfg(tmp_path)
+    cases = [
+        ("pack.zip", 0, OUTPUT_SAMEDIR, True),
+        ("pack.zip", 0, OUTPUT_WORKDIR, True),
+        ("pack.zip", 0, OUTPUT_WORKDIR, False),
+        ("inner.7z", 1, OUTPUT_SAMEDIR, True),
+        ("inner.7z", 1, OUTPUT_WORKDIR, False),
+    ]
+    for name, depth, mode, copy_back in cases:
+        plan = plan_output(_task(tmp_path, name, depth=depth), cfg, mode, copy_back=copy_back)
+        assert plan.out_dir.name == archive_dir_name(name), (name, depth, mode, copy_back)
 
 
 def test_copy_back_flag_ignored_in_samedir_mode(tmp_path):

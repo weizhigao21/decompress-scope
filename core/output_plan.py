@@ -8,7 +8,8 @@
   省掉跨盘复制，也符合「解压到压缩包目录」的直觉。
 
 嵌套的内层压缩包一律留在 workdir 内展开（它们是中间产物，不属于最终交付），
-最终落点由最外层任务决定。
+最终落点由最外层任务决定；它们的**包名会保留成一级目录名**，见
+Pipeline._deliver_hierarchy。
 """
 from __future__ import annotations
 
@@ -33,6 +34,19 @@ class OutputPlan:
 def _safe_component(name: str) -> str:
     """兼容旧名：samedir 的目录名消毒，实际实现见 appconfig.sanitize_component。"""
     return sanitize_component(name)
+
+
+def archive_dir_name(archive) -> str:
+    """压缩包路径 → 单层目录名（已消毒）。
+
+    内层包与最外层包都用它命名产物目录，所以必须是同一个函数——两处各写一份
+    迟早会漂移出两种叫法。
+
+    绝不能直接把 stem 当目录名：`...zip` 的 stem 正好是 `".."`，拼进
+    `<源目录>/_解压开镜/` 之后路径 normalize 回来就是**源目录本身**，产物会被
+    平铺进用户的下载目录。与盘符逃逸同族——都是把外部字符串直接当路径成分。
+    """
+    return sanitize_component(Path(archive).stem)
 
 
 def unique_path(base: Path) -> Path:
@@ -82,25 +96,30 @@ def plan_output(    task,
 ) -> OutputPlan:
     """按模式给出该任务的输出方案。纯函数：只看参数与目标目录是否存在。
 
+    不变式：**`plan.out_dir.name` 恒等于该包的目录名**（见 archive_dir_name）。
+    每个任务的产物都先落在以自己包名命名的目录里，交付时整目录搬到父产物的
+    对应位置。内层包的包名因此在最终产物里留下一级目录，而不是被拍平丢掉。
+
     - 嵌套任务（depth > 0）恒在 workdir 内展开：它们是中间产物，不属于最终交付。
     - samedir 模式 + 最外层：直接解到 <源目录>/<subdir>/<包名>/。
-    - workdir 模式 + 最外层 + copy_back：解到 workdir/task_<id>/out，成功后
-      复制回 <源目录>/<subdir>/<包名>/（复制失败只警告，任务仍算成功）。
-    - workdir 模式 + 最外层 + 不 copy_back：纯隔离，源目录不动。
+    - workdir 模式 + 最外层 + copy_back：解到 workdir/task_<id>/out/<包名>，
+      成功后复制回 <源目录>/<subdir>/<包名>/（复制失败只警告，任务仍算成功）。
+    - workdir 模式 + 最外层 + 不 copy_back：纯隔离，源目录不动；工作目录里的
+      产物同样带着包名，用户去翻工作目录时也能认出哪个目录是哪个包。
     """
     task_dir = Path(cfg.workdir) / f"task_{task.id}"
-    out_dir = task_dir / "out"
     archive = Path(task.archive_path)
+    out_dir = task_dir / "out" / archive_dir_name(archive)
 
     if mode != OUTPUT_SAMEDIR or task.depth > 0:
         target = None
         if task.depth == 0 and mode == OUTPUT_WORKDIR and copy_back:
-            target = archive.parent / sanitize_component(subdir_name) / archive.stem
+            target = archive.parent / sanitize_component(subdir_name) / archive_dir_name(archive)
         return OutputPlan(out_dir=out_dir, final_dir=target, copy_back=target is not None)
 
     # samedir 模式：直接在源目录旁解压
     parent = archive.parent / sanitize_component(subdir_name)
-    base = parent / archive.stem
+    base = parent / archive_dir_name(archive)
     if force_new or not cfg.overwrite_existing:
         final = unique_path(base)
     else:

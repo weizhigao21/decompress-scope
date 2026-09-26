@@ -7,6 +7,7 @@
                           [--force] [--timeout 秒]
     python cli.py pass-add <密码> [--source 域名]
     python cli.py pass-list
+    python cli.py clean-workdir [--path 工作目录] [--yes] [--all]
     python cli.py config                # 打印当前配置
     python cli.py config --set key=val  # 改配置（可多次）
 """
@@ -18,9 +19,11 @@ from pathlib import Path
 
 from core.appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR, AppConfig
 from core.config import Config
+from core.formatting import human_size
 from core.pipeline import Pipeline, RunReport
 from core.store import TaskStore
 from core.vault import PasswordVault
+from core.workdir_cleanup import prune, scan_workdir
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
@@ -42,7 +45,18 @@ def _print_report(report: RunReport, cfg: Config) -> None:
     line = f"成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}"
     if report.skipped:
         line += f" | 已跳过 {report.skipped}"
+    if report.delivery_failed:
+        line += f" | 未交付 {report.delivery_failed}"
     print(line)
+    if report.delivery_failed_tasks:
+        # 单独成段而不是混进「警告」：解压成功但产物没到手上，是用户最容易
+        # 误判为"已经好了"的情况，必须给出明确的下一步。
+        print("-- 解压成功但产物未交付（仍在工作目录）--")
+        for t in report.delivery_failed_tasks:
+            print(f"  #{t.id} {t.archive_path}")
+            print(f"      {t.delivery_error}")
+        print(f"  产物仍在: {cfg.workdir}")
+        print("  处理：修好目标位置后重跑，或用 clean-workdir 查看/清理")
     if report.skipped_tasks:
         print("-- 已跳过（此前已成功解压）--")
         for t in report.skipped_tasks:
@@ -63,6 +77,72 @@ def _print_report(report: RunReport, cfg: Config) -> None:
     print(f"工作目录: {cfg.workdir}")
     print(f"密码库: {DEFAULT_DB}")
     print(f"解压超时: {cfg.extract_timeout:.0f}s/包")
+
+
+def _cmd_clean_workdir(args) -> int:
+    """盘点 / 清理隔离工作目录残留。默认只盘点，删除必须显式 --yes。
+
+    为什么要单独一条命令：工作目录里的东西全是"解压成功"的状态，库里 done、
+    界面显示「完成」——用户没有任何入口知道磁盘被吃了多少。这里把每一份残留
+    的定性（可清理 / 请保留）和理由都摊开，删不删由用户决定。
+    """
+    pref = AppConfig.ensure(CONFIG_PATH)
+    # 走 resolve_workdir 而不是直接用 pref.workdir：后者可能是空串或相对路径
+    # （"空 = 项目/.workspace"），直接 Path() 出来会得到当前目录 `.` ——
+    # 于是盘点的是调用者的 cwd，报"没有残留"，而 5GB 就在项目目录里躺着。
+    workdir = (Path(args.path).expanduser() if args.path
+               else pref.resolve_workdir(PROJECT_ROOT))
+    if not workdir.is_dir():
+        print(f"[错误] 工作目录不存在: {workdir}")
+        return 2
+
+    store = TaskStore(DEFAULT_DB)
+    try:
+        leftovers = scan_workdir(workdir, store)
+    finally:
+        store.close()
+
+    print(f"工作目录: {workdir}")
+    if not leftovers:
+        print("没有残留。")
+        return 0
+
+    total = sum(lo.size for lo in leftovers)
+    safe_items = [lo for lo in leftovers if lo.safe]
+    print(f"共 {len(leftovers)} 项，合计 {human_size(total)}"
+          f"（其中可安全清理 {len(safe_items)} 项 / {human_size(sum(x.size for x in safe_items))}）")
+    print()
+    for lo in leftovers:
+        mark = "✔" if lo.safe else "·"
+        print(f"  {mark} {lo.path.name}  [{lo.label}]  {human_size(lo.size)}  {lo.files} 文件")
+        print(f"      {lo.reason}")
+
+    if not args.yes:
+        print()
+        print("以上仅为盘点，未删除任何文件。")
+        print(f"清理已交付的副本：      python cli.py clean-workdir --yes")
+        print(f"连「请保留/待确认」也清：python cli.py clean-workdir --yes --all"
+              f"   ← 有丢失唯一副本的风险")
+        return 0
+
+    targets = leftovers if args.all else safe_items
+    if not targets:
+        print()
+        print("没有可安全清理的项；要强清请加 --all（可能删掉唯一副本）。")
+        return 0
+    if args.all:
+        unsafe = [lo for lo in targets if not lo.safe]
+        if unsafe:
+            print()
+            print(f"【警告】--all 将删除 {len(unsafe)} 项「请保留 / 待确认」的目录，"
+                  f"它们可能是这些产物的唯一副本。")
+
+    freed, errors = prune(targets, workdir, allow_unsafe=args.all)
+    print()
+    print(f"已清理 {len(targets) - len(errors)} 项，释放 {human_size(freed)}")
+    for e in errors:
+        print(f"  {e}")
+    return 1 if errors else 0
 
 
 def _cmd_config(args) -> int:
@@ -162,6 +242,12 @@ def main(argv: list[str] | None = None) -> int:
     p_cfg.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                        help="修改配置项，可重复：--set max_depth=6 --set output_mode=samedir")
 
+    p_clean = sub.add_parser("clean-workdir", help="盘点/清理隔离工作目录里的残留产物")
+    p_clean.add_argument("--path", default=None, help="工作目录(默认取 config.json)")
+    p_clean.add_argument("--yes", action="store_true", help="真的删除（不加则只盘点）")
+    p_clean.add_argument("--all", action="store_true",
+                         help="连「请保留/待确认」的目录一起删 —— 可能删掉唯一副本")
+
     sub.add_parser("gui", help="启动图形界面(需要 PySide6)")
 
     args = parser.parse_args(argv)
@@ -170,6 +256,9 @@ def main(argv: list[str] | None = None) -> int:
         from ui.app import launch
 
         return launch()
+
+    if args.cmd == "clean-workdir":
+        return _cmd_clean_workdir(args)
 
     if args.cmd == "config":
         return _cmd_config(args)
@@ -246,7 +335,11 @@ def main(argv: list[str] | None = None) -> int:
     pipe.copy_back = copy_back
     report = pipe.run([Path(p) for p in args.paths], source=args.source)
     _print_report(report, cfg)
-    return 0 if report.failed == 0 and report.needs_password == 0 else 1
+    # 交付失败也算「这一轮没完全成功」：产物确实解出来了，但用户手上没拿到。
+    # 退 0 会让脚本编排以为一切正常，正是"库里 done、界面完成、什么都没有"的脚本版。
+    if report.failed or report.needs_password or report.delivery_failed:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

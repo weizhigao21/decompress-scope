@@ -14,8 +14,14 @@ from pathlib import Path
 from .appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR
 from .archive_detect import COMPOUND_ZIP_EXTS, looks_like_archive, volume_info
 from .config import Config
-from .models import AttemptOutcome, Task, TaskStatus
-from .output_plan import OutputPlan, plan_output, same_volume, unique_path
+from .models import ArchiveInfo, AttemptOutcome, Task, TaskStatus
+from .output_plan import (
+    OutputPlan,
+    archive_dir_name,
+    plan_output,
+    same_volume,
+    unique_path,
+)
 from .password_finder import build_candidates, extract_source
 from .probe import ProbeError, check_bomb, classify_extract, probe, probe_with_password
 from .sevenzip import SevenZip, SevenZipCancelled
@@ -29,8 +35,13 @@ class RunReport:
     failed: int = 0
     needs_password: int = 0
     skipped: int = 0
+    # 解压成功但产物没能交付回源目录的任务数。绝不该被算进 failed——产物确实解出来了，
+    # 只是还在工作目录里；但也绝不该被藏起来，否则就是"库里 done、界面完成、
+    # 用户手上什么都没有"。
+    delivery_failed: int = 0
     needs_password_tasks: list[Task] = field(default_factory=list)
     skipped_tasks: list[Task] = field(default_factory=list)
+    delivery_failed_tasks: list[Task] = field(default_factory=list)
     output_dirs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -148,7 +159,9 @@ class Pipeline:
     ) -> RunReport:
         """可选回调（均为普通可调用对象，core 不依赖任何 UI 框架）:
 
-        - on_event(dict): 事件流，kind ∈ {'task','status','progress','warning'}
+        - on_event(dict): 事件流，
+          kind ∈ {'task','status','progress','info','warning'}
+          （info = 包体信息，见 _emit_archive_info）
         - should_cancel(): 返回 True 时在当前任务完成后停止处理剩余任务
         - ask_password({"path": ...}) -> str | None:
           密码候选全部失败时现场询问（如 UI 弹窗），返回密码则立即重试，
@@ -223,6 +236,26 @@ class Pipeline:
 
     # ---------- 单任务处理 ----------
 
+    def _emit_archive_info(self, task: Task, info: ArchiveInfo) -> None:
+        """把探测到的包体信息推给界面：类型 / 压缩包大小 / 解压后大小 / 文件数 / 是否加密。
+
+        单独成一种事件而不是挂在 status 上：status 是状态机迁移（一个任务要发好几
+        次），而包体信息是"探到了新数据"才发——头部加密的包在拿到密码复探之后
+        就是第二次，界面据此把解压后大小从空补齐。
+        """
+        self._emit({
+            "kind": "info",
+            "task_id": task.id,
+            "format": info.format_name,
+            "archive_size": info.archive_size,
+            "volumes": info.volume_count,
+            "uncompressed": info.total_uncompressed,
+            "files": info.file_count,
+            # 两种加密形态都要算：zipcrypto 只加密内容（条目带 Encrypted=+），
+            # 7z 的 -mhe=on 连目录一起加密（空密码列不出目录）。
+            "encrypted": bool(info.flag_encrypted or info.needs_password_for_listing),
+        })
+
     def _process(self, task: Task, queue: deque[Task], run_tasks: list[Task], report: RunReport) -> None:
         archive = Path(task.archive_path)
         self._set(task, TaskStatus.PROBING)
@@ -232,6 +265,9 @@ class Pipeline:
             task.error = f"探测失败: {exc}"
             self._set(task, TaskStatus.FAILED)
             return
+        # 先报包体信息，再判 bomb：被判拒的包恰恰最需要让用户看清"是什么、多大"，
+        # 顺序反了就会留下一行只有失败原因的空白任务。
+        self._emit_archive_info(task, info)
         bomb_reason = check_bomb(info, self.cfg)
         if bomb_reason:
             task.error = bomb_reason
@@ -267,6 +303,9 @@ class Pipeline:
         if info.needs_password_for_listing and outcome.password:
             real = probe_with_password(self.sz, archive, outcome.password)
             if real is not None:
+                # 复探拿到了真实条目，补发一次包体信息：界面上"解压后大小/文件数"
+                # 从空变成有值，用户能看到这个包到底有多大。
+                self._emit_archive_info(task, real)
                 bomb_reason = check_bomb(real, self.cfg)
                 if bomb_reason:
                     shutil.rmtree(plan.out_dir, ignore_errors=True)
@@ -318,61 +357,118 @@ class Pipeline:
         except OSError:
             pass
 
-    def _deliver_hierarchy(self, run_tasks: list[Task], report: RunReport) -> None:
-        """把嵌套任务的产物归并到最外层的交付目录。
+    def _record_delivery_failure(self, task: Task, msg: str, report: RunReport) -> None:
+        """产物没能落到该去的地方：落库 + 双通道告警（report 给 CLI，事件给 UI）。
 
-        为什么需要：内层压缩包一律在 workdir 里展开（避免中间产物污染用户目录），
-        所以最外层的交付目录里只会看到内层压缩包本身——而它随后会被
-        delete_intermediate 删掉。用户最终拿到的目录就成了"少了几层内容"的残缺品。
-        这里自底向上，把每个已成功任务 out_dir 里的非压缩包内容，合并进它父任务的
-        out_dir，逐层上传，直到最外层。
+        为什么不能只往 report.warnings 里塞一句就 continue（旧实现就是这么干的）：
+        那条警告只活在本次运行的内存里。运行结束，库里那条记录仍是 DONE、界面
+        仍是「完成」，而用户的目标目录里什么都没有——产物还压在隔离工作目录里
+        吃磁盘，且下一次重跑会因为「产物仍在」被幂等跳过。库里没有任何一行能
+        回答"我上次那 5 GB 去哪了"。
+
+        状态刻意不动：解压确实成功了，把它改成 FAILED 会让用户以为包是坏的、
+        跑去重新解压（然后被同名避让堆出一份新的）。真正缺的信息用
+        delivery_error 单独表达。
+        """
+        task.delivery_error = msg
+        try:
+            self.store.update(task)
+        except Exception:
+            pass  # 落库失败不该让整轮运行崩掉，事件与 report 通道仍然有记录
+        report.warnings.append(msg)
+        self._emit({"kind": "warning", "message": msg})
+        self._emit({
+            "kind": "status", "task_id": task.id, "status": task.status.value,
+            "password_used": task.password_used, "error": task.error,
+            "extracted_dir": task.extracted_dir, "delivery_error": msg,
+        })
+
+    def _deliver_hierarchy(self, run_tasks: list[Task], report: RunReport) -> None:
+        """把嵌套任务的产物按「包名」逐层落进父任务的交付目录。
+
+        内层压缩包一律在自己的隔离 out_dir 里展开（避免中间产物污染用户目录），
+        结束时把它**整目录搬到它在父产物中的原位置**，目录名换成自己的包名：
+
+            outer.zip → data/inner.zip → deep.txt
+            ⇒ <交付>/outer/data/inner/deep.txt
+
+        按深度降序上传，所以搬某一层时它下面的层已经就位、随之一起搬走。
+
+        为什么不能像旧实现那样把内层内容「拍平」进外层目录：拍平后内层包名彻底
+        消失，用户拿到的东西看不出是从哪个包来的；一个外层套多个内层包时，各包
+        内容更是全糊在同一层里分不开。保留层级则包名与层级都在产物里。
         """
         by_id = {t.id: t for t in run_tasks}
         plans = self._plans
-        # 按深度降序处理：先收最内层，再往上传，避免路径在处理途中被搬走
         for t in sorted(run_tasks, key=lambda x: x.depth, reverse=True):
             if t.status != TaskStatus.DONE or t.parent_id is None:
                 continue
-            child_plan = plans.get(t.id)
+            parent = by_id.get(t.parent_id)
             parent_plan = plans.get(t.parent_id)
-            if child_plan is None or parent_plan is None:
+            child_plan = plans.get(t.id)
+            if parent is None or parent_plan is None or child_plan is None:
+                continue
+            # 父任务失败时它的 out_dir 已被收掉，此时把子产物搬进去等于凭空复活
+            # 一个不该存在的目录（samedir 下还会直接出现在用户源目录里）。
+            if parent.status != TaskStatus.DONE:
                 continue
             if not child_plan.out_dir.is_dir():
                 continue
-            src_root = child_plan.out_dir.resolve()
-            dst_root = parent_plan.out_dir
+
+            anchor = parent_plan.out_dir
             try:
-                dst_root.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                report.warnings.append(f"归并内层产物失败：{dst_root} — {exc}")
+                rel = Path(t.archive_path).resolve().relative_to(anchor.resolve())
+            except (ValueError, OSError):
+                # 内层包不在父产物里（被用户搬走等）：无从判断该落在哪一级。
+                # 但**不能静默 continue**——这条分支此前一声不响地放过，产物就
+                # 留在工作目录里，而库里是 DONE、界面显示「完成」。用户既看不到
+                # 提示，也没有任何线索指向那堆残留。
+                self._record_delivery_failure(
+                    t,
+                    f"内层产物无法定位归属（内层包已不在父产物内），仍留在工作目录："
+                    f"{child_plan.out_dir}",
+                    report,
+                )
+                continue
+            target = anchor / rel.parent / archive_dir_name(rel)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target = unique_path(target)
+                shutil.move(str(child_plan.out_dir), str(target))
+            except (OSError, shutil.Error) as exc:
+                self._record_delivery_failure(
+                    t,
+                    f"内层产物落到外层失败（产物仍在工作目录）："
+                    f"{child_plan.out_dir} → {target} — {exc}",
+                    report,
+                )
                 continue
 
-            for item in list(src_root.iterdir()):
-                # 内层压缩包本身是中间产物，不搬走也不留给用户——直接删。
-                # 它的内容已经由它自己的 out_dir 归并上来（本函数的自底向上遍历保证）。
+            # 已消化的内层压缩包不留在交付里。
+            #
+            # 删除点特意放在本函数而不是 _prune_consumed_archives：那里靠「相对
+            # T.out_dir 的路径」定位，而深度 ≥2 时中间层的 out_dir 已被本函数搬走，
+            # 锚点失效 → 那些包永远清不掉。此刻 rel 就是它的确切位置，最可靠。
+            # 关掉 delete_intermediate 时不删，用户就能同时拿到包与解出的目录。
+            if self.cfg.delete_intermediate:
                 try:
-                    if item.is_file() and self._looks_like_archive(item):
-                        item.unlink(missing_ok=True)
-                        continue
+                    (anchor / rel).unlink(missing_ok=True)
                 except OSError:
-                    continue
-                target = dst_root / item.name
-                try:
-                    if target.exists():
-                        target = unique_path(target)
-                    shutil.move(str(item), str(target))
-                except (OSError, shutil.Error) as exc:
-                    msg = f"内层产物覆盖到外层失败：{item} → {target} — {exc}"
-                    report.warnings.append(msg)
-                    self._emit({"kind": "warning", "message": msg})
+                    pass
 
-            # 内层产物搬空后，把工作目录里的壳收掉，别攒垃圾
+            # out_dir 整个搬走后只剩空壳，顺手把 workdir 里的 task_<id>/out/ 两层
+            # 空目录收掉，别攒垃圾（绝不越过 workdir 根，也绝不删非空目录）
             try:
-                if src_root.is_dir() and not any(src_root.iterdir()):
-                    src_root.rmdir()
-                    inner_parent = src_root.parent
-                    if inner_parent.is_dir() and not any(inner_parent.iterdir()):
-                        inner_parent.rmdir()
+                root = Path(self.cfg.workdir).resolve()
+                shell = child_plan.out_dir.parent
+                for _ in range(2):
+                    if not shell.is_dir() or shell.resolve() == root:
+                        break
+                    if any(shell.iterdir()):
+                        break
+                    shell.rmdir()
+                    shell = shell.parent
             except OSError:
                 pass
 
@@ -586,9 +682,9 @@ class Pipeline:
         """workdir 模式下把最外层任务的产物交付回源压缩包所在目录。
 
         同卷走 rename（单个原子系统调用，省一半写入与磁盘），跨卷才逐文件复制。
-        尽力而为：目标已存在则避让到「包名 (2)」，空间不足/无权限只记一条警告，
-        不影响任务的成功状态。警告同时进 report 与事件流——CLI 只读 report，
-        UI 只读事件流，两边都不能瞎。
+        尽力而为：目标已存在则避让到「包名 (2)」，空间不足/无权限记一条警告并把
+        失败**落库**（delivery_error），任务状态仍算成功——解压本身没出错。
+        警告同时进 report 与事件流：CLI 只读 report，UI 只读事件流，两边都不能瞎。
         """
         for t in run_tasks:
             if t.status != TaskStatus.DONE or t.depth != 0:
@@ -600,32 +696,34 @@ class Pipeline:
             if not src.is_dir():
                 continue
 
-            def _warn(msg: str) -> None:
-                plan.warnings.append(msg)
-                report.warnings.append(msg)
-                self._emit({"kind": "warning", "message": msg})
-
             # 目标已存在则避让到 "包名 (2)"，与前一份产物并存（绝不覆盖）
             target = dst if not dst.exists() else unique_path(dst)
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                moved = self._place_tree(src, target)
+                self._place_tree(src, target)
             except (OSError, shutil.Error) as exc:
-                _warn(f"交付到源目录失败（产物仍在工作目录）：{target} — {exc}")
+                self._record_delivery_failure(
+                    t,
+                    f"交付到源目录失败（产物仍在工作目录 {src}）：{target} — {exc}",
+                    report,
+                )
                 continue
 
-            if moved:
-                # 产物被搬走后真实落点变了，必须同步回任务与库——否则
-                # report.output_dirs 会指向已经消失的工作目录（UI「打开目录」失效），
-                # 库里的 extracted_dir 也会失效，令下次重跑的幂等跳过永远
-                # 判不出"产物仍在"，跳过功能在 workdir 模式下等于没做。
-                t.extracted_dir = str(target)
-                self.store.update(t)
+            # 交付成功（无论是搬到目标还是复制到目标）：真实落点变了，必须同步
+            # 回任务与库。跨卷时 _place_tree 走 copytree，src 会作为兜底副本留在
+            # 工作目录里——此时 extracted_dir 若仍指着工作目录，界面「打开目录」
+            # 就会开到隔离区，用户明明拿到了文件却以为没解出来；工作目录里那份
+            # 也会被残留扫描误判成"还没交付"。
+            t.extracted_dir = str(target)
+            self.store.update(t)
             if target != dst:
-                _warn(f"目标目录已存在，产物另存为：{target}")
+                msg = f"目标目录已存在，产物另存为：{target}"
+                plan.warnings.append(msg)
+                report.warnings.append(msg)
+                self._emit({"kind": "warning", "message": msg})
 
-    def _place_tree(self, src: Path, dst: Path) -> bool:
-        """把 src 交付到 dst，返回是否发生了搬移（src 已不在原地）。
+    def _place_tree(self, src: Path, dst: Path) -> None:
+        """把 src 交付到 dst。
 
         同卷优先 rename：单个系统调用、原子、不占额外磁盘，因此不需要
         "留在工作目录"的兜底副本。跨卷时 rename 会在系统层退化成逐文件
@@ -635,17 +733,21 @@ class Pipeline:
         if same_volume(src, dst.parent):
             try:
                 os.rename(src, dst)
-                return True
+                return
             except OSError:
                 pass  # 回落 copytree：可能跨设备，或目标刚被并发创建
         shutil.copytree(src, dst, dirs_exist_ok=True)
-        return False
 
 
     def _fill_report(self, report: RunReport, run_tasks: list[Task]) -> None:
         for t in run_tasks:
             if t.status == TaskStatus.DONE:
                 report.done += 1
+                # 交付失败单独计数：它既不能被算作 failed（产物确实解出来了），
+                # 也不能只躺在 warnings 里——CLI 的退出码与 UI 的横幅都靠它。
+                if t.delivery_error:
+                    report.delivery_failed += 1
+                    report.delivery_failed_tasks.append(t)
                 # 只报最外层任务的落点：内层产物会被 _deliver_hierarchy 归并到最
                 # 外层目录，内层自己的 out_dir 随后就被收掉了，报出来是条死路径。
                 #
@@ -665,4 +767,5 @@ class Pipeline:
         self.store.update(task)
         self._emit({"kind": "status", "task_id": task.id, "status": task.status.value,
                     "password_used": task.password_used, "error": task.error,
-                    "extracted_dir": task.extracted_dir})
+                    "extracted_dir": task.extracted_dir,
+                    "delivery_error": task.delivery_error})

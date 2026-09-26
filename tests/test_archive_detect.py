@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from core.archive_detect import COMPOUND_ZIP_EXTS, looks_like_archive, volume_info
+from core.archive_detect import (
+    COMPOUND_ZIP_EXTS,
+    looks_like_archive,
+    sniff_format,
+    volume_group_total,
+    volume_info,
+)
 from core.config import Config
 from core.pipeline import Pipeline
 from core.store import TaskStore
@@ -144,6 +150,78 @@ def test_volume_info_non_volume():
     assert volume_info(Path("a.7z.001.txt")) is None
 
 
+# ---------- 分卷包的大小 = 整组之和，不是首卷 ----------
+
+def _vol(tmp_path: Path, name: str, size: int) -> Path:
+    p = tmp_path / name
+    p.write_bytes(b"x" * size)
+    return p
+
+
+def test_volume_group_total_sums_split_style(tmp_path):
+    """`a.zip.001~004` 的大小必须是整组之和。
+
+    任务里存的 archive_path 只是首卷；只报它会把这个包显示成 1/4 大小。
+    """
+    for n, size in ((1, 1_048_576), (2, 1_048_576), (3, 1_048_576), (4, 148)):
+        _vol(tmp_path, f"pack.zip.{n:03d}", size)
+
+    assert volume_group_total(tmp_path / "pack.zip.001") == (3_145_876, 4)
+
+
+def test_volume_group_total_sums_part_style(tmp_path):
+    """WinRAR 风格同样按整组算（后缀都是 .rar，扩展名判定区分不了）。"""
+    for n in (1, 2, 3):
+        _vol(tmp_path, f"a.part{n:02d}.rar", 100)
+
+    assert volume_group_total(tmp_path / "a.part02.rar") == (300, 3)
+
+
+def test_volume_group_total_non_volume_is_own_size(tmp_path):
+    """非分卷走原路：自身大小、1 卷。不能让所有包都去遍历目录。"""
+    f = _vol(tmp_path, "plain.zip", 777)
+    assert volume_group_total(f) == (777, 1)
+
+
+def test_volume_group_total_excludes_other_groups(tmp_path):
+    """同目录下另一组的分卷、以及同名前缀的非分卷包，都不能算进来。"""
+    _vol(tmp_path, "pack.zip.001", 100)
+    _vol(tmp_path, "pack.zip.002", 100)
+    _vol(tmp_path, "other.zip.001", 9_999)
+    _vol(tmp_path, "pack.zip", 5_000)       # 非分卷，名字前缀相同
+
+    assert volume_group_total(tmp_path / "pack.zip.001") == (200, 2)
+
+
+def test_volume_group_total_skips_directories(tmp_path):
+    """目录名长得像分卷也不能计入——名字匹配不代表它是分卷文件。"""
+    _vol(tmp_path, "pack.zip.001", 100)
+    (tmp_path / "pack.zip.002").mkdir()
+
+    assert volume_group_total(tmp_path / "pack.zip.001") == (100, 1)
+
+
+def test_volume_group_total_tolerates_missing_volumes(tmp_path):
+    """缺号（002 丢了）仍统计现有的卷：既不编造，也不退回"只报首卷"。"""
+    _vol(tmp_path, "pack.7z.001", 100)
+    _vol(tmp_path, "pack.7z.003", 50)
+
+    assert volume_group_total(tmp_path / "pack.7z.001") == (150, 2)
+
+
+def test_volume_group_total_case_insensitive_grouping(tmp_path):
+    """大小写混写的分卷仍在同一组（大写盘/解压工具会产出全大写名）。"""
+    _vol(tmp_path, "A.PART01.RAR", 100)
+    _vol(tmp_path, "a.part02.rar", 200)
+
+    assert volume_group_total(tmp_path / "A.PART01.RAR") == (300, 2)
+
+
+def test_volume_group_total_missing_file_is_zero(tmp_path):
+    """文件读不到时返回 (0, 1) 而不是抛异常——探测的失败分支要能安全调用。"""
+    assert volume_group_total(tmp_path / "nope.zip.001") == (0, 1)
+
+
 def test_part_volumes_collapse_to_single_task(tmp_path):
     """P0-3 回归：part1/part2/part3.rar 后缀都是 .rar，旧实现会入队 3 个任务。
 
@@ -209,3 +287,63 @@ def test_unknown_ext_still_sniffed(tmp_path):
     p = tmp_path / "blob.dat"
     p.write_bytes(b"PK\x03\x04" + b"\x00" * 32)
     assert looks_like_archive(p) is True
+
+
+# ---------- sniff_format: 兜底给出压缩包类型名 ----------
+
+def test_sniff_format_names(tmp_path):
+    """需要对头部加密的包给出格式名——这种包 7z 连 `Type` 都列不出来。
+
+    命名刻意对齐 7z `l -slt` 报出的短名（zip/7z/tar/gzip/bzip2/xz/wim），
+    免得同一个包在两条路径下显示出两种叫法。
+    """
+    cases = [
+        (b"PK\x03\x04", "zip"),
+        (b"7z\xbc\xaf\x27\x1c", "7z"),
+        (b"Rar!\x1a\x07\x01\x00", "rar"),
+        (b"\x1f\x8b\x08\x00", "gzip"),
+        (b"BZh9", "bzip2"),
+        (b"\xfd7zXZ\x00", "xz"),
+        (b"MSCF\x00\x00\x00\x00", "cab"),
+        (b"MSWIM\x00\x00\x00", "wim"),
+    ]
+    for magic, name in cases:
+        p = tmp_path / f"blob_{name}"
+        p.write_bytes(magic + b"\x00" * 64)
+        assert sniff_format(p) == name, f"{magic!r} 应识别为 {name}"
+
+
+def test_sniff_format_tar_and_iso(tmp_path):
+    tar = bytearray(b"\x00" * 512)
+    tar[257:262] = b"ustar"
+    p = tmp_path / "plain_tar"
+    p.write_bytes(bytes(tar))
+    assert sniff_format(p) == "tar"
+
+    iso = bytearray(b"\x00" * (0x8001 + 5))
+    iso[0x8001:0x8006] = b"CD001"
+    d = tmp_path / "disc"
+    d.write_bytes(bytes(iso))
+    assert sniff_format(d) == "iso"
+
+
+def test_sniff_format_unknown_returns_empty(tmp_path):
+    p = tmp_path / "nothing.dat"
+    p.write_bytes(b"definitely not an archive" * 8)
+    assert sniff_format(p) == ""
+
+
+def test_sniff_format_missing_file_returns_empty(tmp_path):
+    """探测兜底不能因为文件读不到而抛异常——它跑在「已经出错」的分支上。"""
+    assert sniff_format(tmp_path / "gone.dat") == ""
+
+
+def test_sniff_format_respects_not_archive_exts(tmp_path):
+    """与 looks_like_archive 共用同一条短路规则：明知不是压缩包的类型不报格式。
+
+    两条路径若各行其是，会出现「扫描时判定不是压缩包、兜底时却又给它贴了类型名」
+    的自相矛盾结果。
+    """
+    p = tmp_path / "photo.jpg"
+    p.write_bytes(b"PK\x03\x04" + b"\x00" * 64)
+    assert sniff_format(p) == ""

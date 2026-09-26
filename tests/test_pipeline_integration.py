@@ -1,4 +1,5 @@
 """真实 7z 集成测试：用 7z 现场构造嵌套/加密压缩包，验证端到端流水线。"""
+import os
 import subprocess
 from pathlib import Path
 
@@ -255,3 +256,186 @@ def test_encrypted_bomb_rejected(tmp_path):
     assert report.done == 0, "加密 bomb 包被解压成功了——安全检查被绕过"
     assert report.failed == 1
     assert not list(cfg.workdir.rglob("zeros.bin")), "被拒后仍残留了解压产物"
+
+
+# ---------- info 事件：把包体信息送到界面 ----------
+
+def _infos(events: list[dict]) -> list[dict]:
+    return [e for e in events if e.get("kind") == "info"]
+
+
+def test_info_event_carries_format_and_size(tmp_path):
+    """探测后必须发 info 事件，带上 7z 报出的格式与压缩包实际大小。"""
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    (inputs / "a.txt").write_text("x" * 4096, encoding="utf-8")
+    _run7z(exe, ["a", "-tzip", "pack.zip", "a.txt"], inputs)
+    size_on_disk = (inputs / "pack.zip").stat().st_size
+
+    events: list[dict] = []
+    pipe.run([inputs], on_event=events.append)
+
+    infos = _infos(events)
+    assert len(infos) == 1, "一次探测应只发一条 info"
+    info = infos[0]
+    assert info["format"] == "zip"
+    assert info["archive_size"] == size_on_disk
+    assert info["uncompressed"] == 4096
+    assert info["files"] == 1
+    assert info["encrypted"] is False
+    assert isinstance(info["task_id"], int)
+
+
+def test_info_event_emitted_before_bomb_rejection(tmp_path):
+    """被判为 bomb 的包也要先报出类型与大小。
+
+    顺序很关键：info 若发在 check_bomb 之后，被拒的包在界面上就是一行空白，
+    用户根本不知道是什么文件、多大——正是最需要这个信息的时候。
+    """
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    cfg.max_total_uncompressed = 1 * 1024 * 1024
+
+    (inputs / "zeros.bin").write_bytes(b"\0" * (5 * 1024 * 1024))
+    _run7z(exe, ["a", "-tzip", "bomb.zip", "zeros.bin"], inputs)
+
+    events: list[dict] = []
+    report = pipe.run([inputs], on_event=events.append)
+
+    assert report.failed == 1
+    infos = _infos(events)
+    assert infos, "被拒的 bomb 包没有收到 info 事件"
+    assert infos[0]["format"] == "zip"
+    assert infos[0]["archive_size"] > 0
+
+
+def test_info_event_for_header_encrypted_uses_magic_fallback(tmp_path):
+    """头部加密的包：7z 列不出目录，`Type` 是空的，须靠 magic 兜底给出格式名。"""
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    (inputs / "a.txt").write_text("x" * 4096, encoding="utf-8")
+    _run7z(exe, ["a", "-t7z", "-mhe=on", "-psecret", "hush.7z", "a.txt"], inputs)
+
+    events: list[dict] = []
+    report = pipe.run([inputs], on_event=events.append)
+
+    assert report.needs_password == 1
+    infos = _infos(events)
+    assert len(infos) == 1
+    assert infos[0]["format"] == "7z", "加密包头包未给出格式名（magic 兜底失效）"
+    assert infos[0]["encrypted"] is True
+    assert infos[0]["archive_size"] > 0
+
+
+def test_info_event_updated_after_password_reprobe(tmp_path):
+    """密码确定后复探 → 再发一条 info，补上真实的解压后大小与文件数。"""
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    (inputs / "a.txt").write_text("x" * 10000, encoding="utf-8")
+    _run7z(exe, ["a", "-t7z", "-mhe=on", "-psecret", "hush.7z", "a.txt"], inputs)
+    vault.add_manual("secret")
+
+    events: list[dict] = []
+    report = pipe.run([inputs], on_event=events.append)
+
+    assert report.done == 1
+    infos = _infos(events)
+    assert len(infos) == 2, "复探后应补发一条 info，供界面更新解压后大小"
+    assert infos[0]["uncompressed"] == 0, "空密码下本就探不到解压后大小"
+    assert infos[-1]["uncompressed"] == 10000
+    assert infos[-1]["files"] == 1
+
+
+# ---------- 分卷包：大小按整组算 ----------
+
+def _split_env(tmp_path, volume: str = "1m"):
+    """造一个真分卷包，返回 (pipe, inputs, 全部按序分卷)。"""
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    (inputs / "big.bin").write_bytes(os.urandom(3 * 1024 * 1024))  # 不可压缩才会切开
+    _run7z(exe, ["a", "-tzip", f"-v{volume}", "pack.zip", "big.bin"], inputs)
+    vols = sorted(p for p in inputs.iterdir() if p.name.startswith("pack.zip."))
+    assert len(vols) >= 2, f"没切成多卷（拿到 {[v.name for v in vols]}），用例失去意义"
+    return pipe, inputs, vols
+
+
+def test_split_volume_size_counts_whole_group(tmp_path):
+    """分卷包报的大小必须是**整组**之和。
+
+    任务里存的 archive_path 只是首卷（`pack.zip.001`），旧实现直接
+    `stat().st_size` 拿首卷大小——界面上一个 3 MB 的分卷包显示成 1 MB，
+    用户看到的数字"看着挺合理"，却跟实际占用差几倍。
+    """
+    pipe, inputs, vols = _split_env(tmp_path)
+    total = sum(v.stat().st_size for v in vols)
+    first = vols[0].stat().st_size
+    assert total > first, "前置条件：整组必须明显大于首卷"
+
+    events: list[dict] = []
+    pipe.run([inputs], on_event=events.append)
+
+    info = _infos(events)[0]
+    assert info["volumes"] == len(vols)
+    assert info["archive_size"] == total, \
+        f"只报了首卷大小（{info['archive_size']} vs 整组 {total}）"
+    assert info["archive_size"] != first
+
+
+def test_split_volume_reports_inner_format_not_split(tmp_path, monkeypatch):
+    """分卷包的类型必须是**里面**的格式，不是 "Split" 这个容器名。
+
+    7z 对分卷首卷会报两行 Type：外层 `Split` 容器在前，内层真实的 `zip` 在后。
+    只取第一个匹配，界面「类型」列就显示成 "Split"——用户问"这是什么包"，
+    得到的回答是"这是分卷"，等于没说。
+
+    **这里必须掐掉 magic 兜底**（`sniff_format` 一律返回空）。
+    不掐的话这条测试就是摆设：兜底单靠自己也能读首卷文件头认出 zip，
+    于是"7z 报告解析"整条主路径失效也测不出来——两条路互相掩盖，
+    正是最典型的假绿。掐掉之后绿才算数，证明真格式确实从 7z 的报告里拿到了。
+
+    用户最终看到什么的保障，由 UI 端到端那条（不掐兜底）负责，两层各司其职。
+    """
+    from core import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "sniff_format", lambda _p: "")
+
+    pipe, inputs, vols = _split_env(tmp_path)
+
+    events: list[dict] = []
+    pipe.run([inputs], on_event=events.append)
+
+    info = _infos(events)[0]
+    assert info["format"] == "zip", f"类型列会显示 {info['format']!r}"
+    assert info["format"] != "Split"
+
+
+def test_split_volume_ratio_uses_group_total_not_first_volume(tmp_path):
+    """压缩比的分母也用整组——否则正常的分卷包会被误判成 zip bomb。
+
+    实测：3 MB 内容压成 4 卷共 124 KB，真比值 25:1；只算首卷（32 KB）则报成
+    96:1。默认阈值 1000:1 下这只是"不准"，但阈值一旦调紧（或分卷数更多），
+    正常包就会被安全机制**拒解**——所以这条必须钉住。
+
+    阈值刻意卡在真比值与首卷比值之间：只算首卷必红，算整组才绿。
+    """
+    exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
+    # 头部 120 KB 不可压缩 + 其余全零：压缩后约 120 KB，解压后 3 MB
+    payload = os.urandom(120 * 1024) + b"\0" * (3 * 1024 * 1024 - 120 * 1024)
+    (inputs / "big.bin").write_bytes(payload)
+    _run7z(exe, ["a", "-t7z", "-v32k", "pack.7z", "big.bin"], inputs)
+    vols = sorted(p for p in inputs.iterdir() if p.name.startswith("pack.7z."))
+    assert len(vols) >= 3, f"没切成多卷（{len(vols)} 卷），用例失去意义"
+
+    total = sum(v.stat().st_size for v in vols)
+    first = vols[0].stat().st_size
+    ratio_whole = len(payload) / total
+    ratio_first = len(payload) / first
+    assert ratio_first > ratio_whole * 2, \
+        f"首卷与整组的比值差别不够大（{ratio_first:.1f} vs {ratio_whole:.1f}），分辨不出对错"
+
+    cfg.max_total_uncompressed = 10 * 1024 ** 3
+    cfg.ratio_floor_bytes = 0                     # 隔离出"比值"这一条判据
+    cfg.max_compression_ratio = (ratio_whole + ratio_first) / 2
+
+    events: list[dict] = []
+    report = pipe.run([inputs], on_event=events.append)
+
+    assert report.failed == 0, (
+        f"正常的分卷包被判成 zip bomb："
+        f"{_infos(events)[0]['archive_size']} 字节的分母算成了首卷")
+    assert report.done == 1

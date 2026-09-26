@@ -4,20 +4,25 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-# (偏移, magic) — 覆盖 zip / rar4+rar5 / 7z / gzip / bzip2 / xz / cab / wim / tar
-_MAGIC_HEADERS: tuple[tuple[int, bytes], ...] = (
-    (0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08"),
-    (0, b"Rar!\x1a\x07"),           # RAR4 与 RAR5 共同前缀
-    (0, b"7z\xbc\xaf\x27\x1c"),
-    (0, b"\x1f\x8b"),               # gzip
-    (0, b"BZh"),                    # bzip2
-    (0, b"\xfd7zXZ\x00"),           # xz
-    (0, b"MSCF"),                   # cab
-    (0, b"MSWIM\x00\x00\x00"),      # wim
-    (0, b"WLPWM\x00\x00\x00"),      # wim
-    (257, b"ustar"),                # tar
+# (偏移, magic, 类型名) — 覆盖 zip / rar4+rar5 / 7z / gzip / bzip2 / xz / cab / wim / tar
+#
+# 类型名刻意与 7z `l -slt` 报出的 `Type` 取值对齐（zip/7z/tar/gzip/bzip2/xz/wim），
+# 免得同一个包走"7z 报告"和"magic 兜底"两条路径时显示出两种叫法。
+_MAGIC_HEADERS: tuple[tuple[int, bytes, str], ...] = (
+    (0, b"PK\x03\x04", "zip"), (0, b"PK\x05\x06", "zip"), (0, b"PK\x07\x08", "zip"),
+    (0, b"Rar!\x1a\x07", "rar"),           # RAR4 与 RAR5 共同前缀
+    (0, b"7z\xbc\xaf\x27\x1c", "7z"),
+    (0, b"\x1f\x8b", "gzip"),
+    (0, b"BZh", "bzip2"),
+    (0, b"\xfd7zXZ\x00", "xz"),
+    (0, b"MSCF", "cab"),
+    (0, b"MSWIM\x00\x00\x00", "wim"),
+    (0, b"WLPWM\x00\x00\x00", "wim"),
+    (257, b"ustar", "tar"),                # tar 的 magic 在 257 偏移
 )
 _ISO_OFFSET = 0x8001  # ISO9660 卷描述符位置
+_ISO_MAGIC = b"CD001"
+_ISO_NAME = "iso"
 
 # 本质是 zip 但属于应用文档/安装包，不应作为压缩包展开
 COMPOUND_ZIP_EXTS = frozenset({
@@ -79,26 +84,102 @@ def volume_info(path: Path) -> tuple[str, int] | None:
     return None
 
 
+def volume_group_total(path: Path) -> tuple[int, int]:
+    """整组分卷的 (总字节数, 卷数)；非分卷返回 (该文件自身大小, 1)。
+
+    为什么不能用 `path.stat().st_size`：分卷包的"压缩包大小"指的是**整组**，
+    而任务里存的 `archive_path` 只是首卷。实测一个 4 卷 7z：
+    首卷 32 KB、整组 124 KB —— 界面把 3 MB 的解压后内容配上 32 KB 的包体，
+    而 `compression_ratio` 的分母正是这个数，于是**压缩比被高估 3.8 倍**
+    （真值 25:1 报成 96:1）。这不只是显示不准：默认 1000:1 的阈值下，
+    一个分卷数够多的正常包会被**误判成 zip bomb 并被拒解**。
+
+    一次目录遍历同时得出"总量"与"卷数"，两个事实来自同一份列表，
+    界面就不可能出现"4 个分卷"配着 3 卷的大小。
+
+    同名不同组不会混：分组标识含扩展名，`a.part01.rar` 与 `a.rar.001` 是两组。
+    读不到的项跳过；一个都没统计到时退回自身大小——宁可少报，不要报 0。
+    """
+    try:
+        own = path.stat().st_size
+    except OSError:
+        own = 0
+    vi = volume_info(path)
+    if vi is None:
+        return own, 1
+    base = vi[0]
+    total = 0
+    count = 0
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError:
+        return own, 1
+    for p in entries:
+        other = volume_info(p)
+        if other is None or other[0] != base:
+            continue
+        try:
+            if not p.is_file():
+                continue
+            total += p.stat().st_size
+            count += 1
+        except OSError:
+            continue
+    if count == 0:
+        return own, 1
+    return total, count
+
+
+def _sniff(path: Path) -> tuple[int, str]:
+    """读文件头识别压缩包，返回 (文件大小, 类型名)；识别不出时类型名为 ""。
+
+    统一入口：looks_like_archive 只关心"是不是"，sniff_format 只关心"是什么"，
+    两者共用同一份读取与匹配逻辑，就不会出现判定漂移。文件读不到/太小一律
+    (大小, "")，绝不抛异常——探测兜底跑的正是「已经出错」的分支。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0, ""
+    if size < 8:
+        return size, ""
+    try:
+        with path.open("rb") as f:
+            head = f.read(_READ_SIZE)
+    except OSError:
+        return size, ""
+    for offset, magic, name in _MAGIC_HEADERS:
+        end = offset + len(magic)
+        if len(head) >= end and head[offset:end] == magic:
+            return size, name
+    if size >= _ISO_OFFSET + 5:
+        try:
+            with path.open("rb") as f:
+                f.seek(_ISO_OFFSET)
+                if f.read(5) == _ISO_MAGIC:
+                    return size, _ISO_NAME
+        except OSError:
+            pass
+    return size, ""
+
+
+def sniff_format(path: Path) -> str:
+    """读文件头给出压缩包类型名（zip/7z/rar/gzip/...）；识别不出返回 ""。
+
+    存在意义：头部加密的包（`-mhe=on` 的 7z、加密文件名的 rar）用空密码连目录
+    都列不出来，`7z l -slt` 里根本没有 `Type = ` 一行，`ArchiveInfo.format_name`
+    就是空的。而界面此刻恰恰要回答"这是什么包"——读 4KB 文件头就能补上。
+
+    与 looks_like_archive 共用 magic 表与扩展名短路规则，理由见 _sniff。
+    """
+    if path.suffix.lower() in _NOT_ARCHIVE_EXTS:
+        return ""
+    return _sniff(path)[1]
+
+
 def looks_like_archive(path: Path) -> bool:
     """读取文件头 magic bytes 判断是否压缩包；无法读取/太小一律按否处理。"""
     if path.suffix.lower() in _NOT_ARCHIVE_EXTS:
         # 已知非压缩类型：不碰磁盘。见 _NOT_ARCHIVE_EXTS 的说明。
         return False
-    try:
-        size = path.stat().st_size
-        if size < 8:
-            return False
-        with path.open("rb") as f:
-            head = f.read(_READ_SIZE)
-        for offset, magic in _MAGIC_HEADERS:
-            end = offset + len(magic)
-            if len(head) >= end and head[offset:end] == magic:
-                return True
-        if size >= _ISO_OFFSET + 5:
-            with path.open("rb") as f:
-                f.seek(_ISO_OFFSET)
-                if f.read(5) == b"CD001":
-                    return True
-    except OSError:
-        return False
-    return False
+    return _sniff(path)[1] != ""

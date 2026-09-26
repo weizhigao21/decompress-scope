@@ -196,6 +196,12 @@ def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):
     锁住"优化只在同卷生效，跨卷行为不变"：同卷 rename 是单个原子系统调用，
     不需要兜底副本；跨卷 rename 会退化成逐文件拷贝且中途失败会留半成品，
     所以那份副本必须留着。
+
+    注意落点的语义（2026-09-26 改）：跨卷走 copytree 时工作目录里的源目录
+    不会消失，但 extracted_dir / output_dirs 必须指向**交付过去的那一份**——
+    它才是用户能拿到产物的地方。此前只有 moved=True 才更新落点，于是跨卷交付
+    成功后 output_dirs 仍指着工作目录：界面「打开目录」开到隔离区，明明交付
+    成功却像没解出来；残留盘点也会把这份冗余副本误判成"还没交付"。
     """
     from core import pipeline as pipeline_mod
 
@@ -206,10 +212,12 @@ def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):
     report = pipe.run([inputs])
 
     assert report.done == 1
-    assert (inputs / "_解压开镜" / "pack" / "note.txt").is_file(), "跨卷仍应交付到源目录"
+    delivered = inputs / "_解压开镜" / "pack"
+    assert (delivered / "note.txt").is_file(), "跨卷仍应交付到源目录"
     assert list(cfg.workdir.rglob("note.txt")), "跨卷交付必须保留工作目录副本兜底"
-    # 没有发生搬移，落点仍是工作目录
-    assert Path(report.output_dirs[0]).is_relative_to(cfg.workdir)
+    assert Path(report.output_dirs[0]) == delivered, \
+        "跨卷交付后落点应指向交付位置，而不是工作目录里的兜底副本"
+    assert report.delivery_failed == 0, "交付成功不该被记成未交付"
 
 
 def test_workdir_copy_back_has_no_consumed_inner_zip(tmp_path):
@@ -230,7 +238,8 @@ def test_workdir_copy_back_has_no_consumed_inner_zip(tmp_path):
 
     assert report.done == 2
     delivered = inputs / "_解压开镜" / "outer"
-    assert (delivered / "deep.txt").is_file()
+    # 内层内容已进交付目录，且**带着自己的包名**（out_dir 末级就是包名目录）
+    assert (delivered / "inner" / "deep.txt").is_file()
     assert not list(delivered.rglob("inner.zip")), \
         f"交付目录残留中间包：{list(delivered.rglob('inner.zip'))}"
 
@@ -275,6 +284,8 @@ def test_nested_lookalike_archive_is_not_pruned(tmp_path):
     survivor = delivered / "data" / "keep" / "inner.zip"
     assert survivor.is_file(), f"子目录里的同名无关文件被误删：{survivor}"
     assert (delivered / "data" / "deep.txt").is_file()
+    # 内层产物按包名成一级目录（内层包只含 data/ 一层，被「单目录上提」提到顶层）
+    assert (delivered / "inner" / "deep.txt").is_file()
 
 
 def test_workdir_mode_pure_isolation_leaves_source_untouched(tmp_path):
@@ -310,7 +321,7 @@ def test_workdir_mode_skips_existing_target_with_warning(tmp_path):
 
 
 def test_samedir_nested_inner_stays_in_workdir(tmp_path):
-    """samedir 模式下，内层包在 workdir 展开，产物归并回外层交付目录。
+    """samedir 模式下，内层包在 workdir 展开，产物带包名归并回外层交付目录。
 
     这是最关键的一条：内层包解出来的内容必须出现在外层最终交付目录里，
     否则 delete_intermediate 删掉内层 zip 后，用户拿到的是残缺品。
@@ -326,9 +337,9 @@ def test_samedir_nested_inner_stays_in_workdir(tmp_path):
 
     assert report.done == 2
     delivered = inputs / "_解压开镜" / "outer"
-    # 内层产物已归并到外层交付目录
-    assert (delivered / "deep.txt").is_file()
-    assert (delivered / "deep.txt").read_text(encoding="utf-8") == "inner"
+    # 内层产物已进外层交付目录，并保留内层包名那一级
+    assert (delivered / "inner" / "deep.txt").is_file()
+    assert (delivered / "inner" / "deep.txt").read_text(encoding="utf-8") == "inner"
     # 内层 zip 本身被清掉（中间产物不该交付给用户）
     assert not list(delivered.rglob("inner.zip"))
     # 源目录下不得出现内层包的独立输出目录
