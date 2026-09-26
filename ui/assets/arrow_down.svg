@@ -1,0 +1,5 @@
+<!-- 下三角：数字框的「减」按钮，同时供下拉框复用。颜色对齐主题 TEXT_MUTED(#8B949E)。
+     尺寸与 QSS 里的 width/height 保持一致（10x6），避免缩放重采样产生锯齿。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6">
+  <path d="M5 5 L1 1 L9 1 Z" fill="#8B949E"/>
+</svg>

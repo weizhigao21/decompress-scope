@@ -1,0 +1,7 @@
+<!-- 复选框勾选态的对勾。
+     颜色固定为白：它只会叠在 ACCENT(#3B9EFF) 蓝底上，不随主题 token 走。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path d="M3.8 8.4 L6.7 11.3 L12.2 4.7"
+        fill="none" stroke="#FFFFFF" stroke-width="2.3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

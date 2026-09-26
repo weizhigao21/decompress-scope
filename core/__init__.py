@@ -4,4 +4,4 @@
 由 tests/test_core_no_qt.py 静态守卫保证。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

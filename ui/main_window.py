@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core import __version__ as APP_VERSION
 from core.appconfig import (
     AUTORUN_CONFIRM,
     AUTORUN_DIRECT,
@@ -51,15 +52,33 @@ from core.appconfig import (
     AppConfig,
 )
 from core.config import Config
+from core.formatting import human_count, human_size
 from core.vault import PasswordVault
+from core.workdir_cleanup import iter_task_dirs
 from ui import theme
 from ui.settings_window import SettingsWindow
 from ui.vault_window import VaultWindow
 from ui.worker import ExtractWorker
+from ui.workdir_window import WorkdirWindow
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
+
+# 任务树列号。用命名常量而不是散落的字面量：往中间插一列会把后面所有下标
+# 平移，而"状态写成文本却落在密码列"这种错位编译期查不出来。
+# 与 ui/vault_window.py 的 _COL_* 保持同一写法。
+(_COL_NAME, _COL_TYPE, _COL_SIZE, _COL_STATUS,
+ _COL_PWD, _COL_PROG, _COL_INFO) = range(7)
+
+# 列宽：文件名占大头，信息列吃掉剩余（setStretchLastSection）
+# 短列按"表头 / 内容最宽者 + 左右各 11px 内边距 + 一点余量"取值，
+# 列之间才会留出均匀的呼吸，而不是有的列空一大片、有的列紧贴。
+_COL_WIDTHS = ((_COL_NAME, 340), (_COL_TYPE, 72), (_COL_SIZE, 84),
+               (_COL_STATUS, 80), (_COL_PWD, 118), (_COL_PROG, 72))
+
+# 任务的当前状态另存一个 role：列 0 的 UserRole 已经放了 task_id
+_STATUS_ROLE = Qt.UserRole + 1
 
 STATUS_TEXT = {
     "pending": "等待",
@@ -68,6 +87,10 @@ STATUS_TEXT = {
     "needs_password": "待密码",
     "done": "完成",
     "failed": "失败",
+    # 不是 core 的 TaskStatus 值，而是「状态 done + delivery_error 非空」在界面上的
+    # 呈现：解压成功了，但产物没送到该去的地方。列宽只有 80px，短词优先，
+    # 完整原因在 tooltip 与信息列里。
+    "done_undelivered": "未交付",
 }
 
 FILE_FILTER = "压缩包 (*.zip *.rar *.7z *.cbz *.cbr *.tar *.gz *.bz2 *.xz *.cab *.iso *.001);;所有文件 (*)"
@@ -129,13 +152,6 @@ class InputList(QListWidget):
                 existing.add(str(path))
         if self.count() == 0:
             self._show_placeholder()
-
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dragMoveEvent(self, event) -> None:
-        event.acceptProposedAction()
 
     def accept_urls(self, urls) -> list[str]:
         """把拖入的本地 URL 并入列表，返回本次新增的真实路径。
@@ -210,6 +226,7 @@ class MainWindow(QMainWindow):
         self._stats = {"pending": 0, "done": 0, "needs_password": 0, "failed": 0}
         self._vault_window: VaultWindow | None = None
         self._settings_window: SettingsWindow | None = None
+        self._workdir_window: WorkdirWindow | None = None
         self._cfg = AppConfig.ensure(CONFIG_PATH)
 
         # 拖入即开始的合并窗口：连续拖入多个文件只启动一次
@@ -220,6 +237,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_cfg_to_ui()
         self._refresh_vault_label()
+        self._refresh_workdir_label()
         self._refresh_empty_state()
         self._restore_last_inputs()
 
@@ -298,6 +316,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_action_bar())
         root.addWidget(self._build_params_panel())
         root.addWidget(self._build_tree(), stretch=1)
+        root.addWidget(self._build_workdir_panel())
         root.addWidget(self._build_vault_panel())
 
         self.statusBar().showMessage("就绪")
@@ -312,6 +331,21 @@ class MainWindow(QMainWindow):
         title_font.setWeight(QFont.DemiBold)
         title.setFont(title_font)
 
+        # 版本号挂在名字右侧，弱色 + 小一号：它属于"这是哪个版本"的元信息，
+        # 用户会专程来找，所以不放状态栏角落；但也不该跟名字抢注意力。
+        # 取值只用 core.__version__ 一处，别在这里写死字符串（会跟 pyproject 漂移）。
+        # 字号走 theme 的 QLabel[role="version"]：这里 setFont 会被全局
+        # `QWidget { font-size: 13px; }` 覆盖，设了等于没设。
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setProperty("role", "version")
+        self.version_label.setToolTip(f"解压开镜 {APP_VERSION}")
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)  # 比 row 的主间距紧：让版本号看起来是名字的附着物
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(title)
+        title_row.addWidget(self.version_label)
+
         # 标题与副标题之间加固定间隔：两者字号相近，紧挨着会读成一句话
         self.subtitle = QLabel("拖入文件即可开始")
         self.subtitle.setStyleSheet(
@@ -322,7 +356,7 @@ class MainWindow(QMainWindow):
         sep.setFixedHeight(13)
         sep.setStyleSheet(f"background-color: {theme.LINE}; border: none;")
 
-        row.addWidget(title)
+        row.addLayout(title_row)
         row.addWidget(sep)
         row.addWidget(self.subtitle)
         row.addStretch(1)
@@ -546,21 +580,95 @@ class MainWindow(QMainWindow):
 
     def _build_tree(self) -> QWidget:
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["压缩包", "状态", "密码", "进度", "信息"])
+        self.tree.setHeaderLabels(
+            ["压缩包", "类型", "大小", "状态", "密码", "进度", "信息"])
         self.tree.setRootIsDecorated(True)
         self.tree.setAlternatingRowColors(False)
         self.tree.setUniformRowHeights(True)
         self.tree.setMinimumHeight(150)
-        self.tree.setColumnWidth(0, 380)
-        self.tree.setColumnWidth(1, 84)
-        self.tree.setColumnWidth(2, 130)
-        self.tree.setColumnWidth(3, 70)
+        for col, width in _COL_WIDTHS:
+            self.tree.setColumnWidth(col, width)
         self.tree.header().setStretchLastSection(True)
+        # 整表一律左对齐，且表头的对齐必须与内容一致。
+        #
+        # 曾经只把「大小」设成右对齐（数字列好扫位数），结果表头行里只有它贴右：
+        # 实测它与左侧「类型」表头隔了 101px、与右侧「状态」只隔 22px，
+        # 六个表头挤一坨又突然拉开——这就是"东倒西歪"的来源。而且同为数字的
+        # 「进度」是左对齐，两个数字列一个贴左一个贴右，更加坐实了错乱感。
+        # 一致（疏密均匀）比"数字右对齐"值钱：这几列的取值宽度差只有几像素，
+        # 右对齐换不来可读性，却破坏了整行的左起视觉基线。
         self.tree.setStyleSheet(
             f"QTreeWidget::item {{ height: 30px; }}"
             f"QTreeWidget::branch {{ background: transparent; }}"
         )
         return self.tree
+
+    def _build_workdir_panel(self) -> QWidget:
+        """工作目录残留入口：一行 = 标题 + 残留项数 + 「查看/清理」按钮。
+
+        为什么要在主界面常驻一行：工作目录里的东西**全都**是「解压成功」状态
+        （库里 done、任务树显示"完成"），用户没有任何线索知道磁盘被吃了多少，
+        也没有入口清掉。5.38 GB 就是这么静静躺着的。
+
+        计数只用一层 iterdir，绝不递归统计大小——常驻控件不能为了一个数字去走
+        几十万个文件，那样开窗就会卡住。真实占用在弹窗里点开才算。
+        """
+        wrapper = QWidget()
+        wrapper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        row = QHBoxLayout(wrapper)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        title = QLabel("工作目录")
+        title.setStyleSheet(f"color: {theme.TEXT}; background: transparent; font-weight: 500;")
+        row.addWidget(title)
+
+        self.workdir_label = QLabel("")
+        self.workdir_label.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; background: transparent;")
+        row.addWidget(self.workdir_label)
+
+        row.addStretch(1)
+
+        self.workdir_open_btn = QPushButton("查看/清理")
+        self.workdir_open_btn.setProperty("ghost", "true")
+        self.workdir_open_btn.setCursor(Qt.PointingHandCursor)
+        self.workdir_open_btn.setToolTip("盘点隔离工作目录里的残留产物，确认后清理")
+        self.workdir_open_btn.clicked.connect(self._open_workdir_window)
+        row.addWidget(self.workdir_open_btn)
+        return wrapper
+
+    def _refresh_workdir_label(self) -> None:
+        try:
+            n = len(iter_task_dirs(self._cfg.resolve_workdir(PROJECT_ROOT)))
+        except OSError:
+            n = 0
+        self.workdir_label.setText(f"{n} 项残留" if n else "无残留")
+        color = theme.WARN if n else theme.TEXT_FAINT
+        self.workdir_label.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def _open_workdir_window(self) -> None:
+        """残留窗口单例；复用密码库那套 closed 信号清理引用。"""
+        if self._workdir_window is None:
+            self._workdir_window = WorkdirWindow(
+                self._cfg.resolve_workdir(PROJECT_ROOT), DEFAULT_DB, parent=self)
+            self._workdir_window.cleaned.connect(self._on_workdir_cleaned)
+            self._workdir_window.closed.connect(self._on_workdir_closed)
+            self._workdir_window.show()
+        else:
+            self._workdir_window.refresh()
+            self._workdir_window.show()
+            self._workdir_window.raise_()
+            self._workdir_window.activateWindow()
+
+    def _on_workdir_cleaned(self, freed: int) -> None:
+        self._refresh_workdir_label()
+        self.statusBar().showMessage(
+            f"已清理工作目录残留，释放 {human_size(freed)}", 8000)
+
+    def _on_workdir_closed(self) -> None:
+        self._workdir_window = None
+        self._refresh_workdir_label()
 
     def _build_vault_panel(self) -> QWidget:
         """密码库入口：一行 = 标题 + 计数 + 「打开密码库」按钮。
@@ -832,14 +940,19 @@ class MainWindow(QMainWindow):
         kind = event.get("kind")
         if kind == "task":
             item = QTreeWidgetItem()
-            item.setData(0, Qt.UserRole, event["task_id"])
-            item.setText(0, Path(event["path"]).name)
-            item.setToolTip(0, event["path"])
-            item.setText(1, STATUS_TEXT["pending"])
-            item.setForeground(1, QColor(theme.STATUS_COLORS["pending"]))
+            item.setData(_COL_NAME, Qt.UserRole, event["task_id"])
+            item.setText(_COL_NAME, Path(event["path"]).name)
+            item.setToolTip(_COL_NAME, event["path"])
+            item.setText(_COL_STATUS, STATUS_TEXT["pending"])
+            item.setForeground(_COL_STATUS, QColor(theme.STATUS_COLORS["pending"]))
+            # 包体信息要等探测完才知道。先摆占位符：空白单元格让人分不清
+            # "还没探到"和"这行根本没这两项"，"—"则明确表示未知。
+            for col in (_COL_TYPE, _COL_SIZE):
+                item.setText(col, "—")
+                item.setForeground(col, QColor(theme.TEXT_FAINT))
             depth = event.get("depth", 0)
             if depth:
-                item.setText(4, f"嵌套第 {depth} 层")
+                item.setText(_COL_INFO, f"嵌套第 {depth} 层")
             parent_item = self._task_items.get(event.get("parent_id"))
             if parent_item is None:
                 self.tree.addTopLevelItem(item)
@@ -849,17 +962,27 @@ class MainWindow(QMainWindow):
             self._task_items[event["task_id"]] = item
             self._bump("pending", 1)
             self.tree.scrollToItem(item)
+        elif kind == "info":
+            self._apply_archive_info(event)
         elif kind == "status":
             item = self._task_items.get(event.get("task_id"))
             if item is None:
                 return
             status = event.get("status", "")
-            old = item.data(2, Qt.UserRole) or "pending"
-            item.setText(1, STATUS_TEXT.get(status, status))
-            color = theme.STATUS_COLORS.get(status)
+            delivery_error = event.get("delivery_error") or ""
+            old = item.data(_COL_STATUS, _STATUS_ROLE) or "pending"
+            # 交付失败要抢在状态之前显示：状态是 done（解压确实成功了），
+            # 但对用户而言"东西没到我手上"才是这条记录的真实含义。
+            #
+            # 注意 role 里存的是**真实状态**（status），不是呈现态（shown）：
+            # 统计与状态迁移都只认真实状态。否则 done → 未交付 会被记成
+            # "done 减一"，四张统计卡的总和对不上任务树里的行数。
+            shown = "done_undelivered" if (status == "done" and delivery_error) else status
+            item.setText(_COL_STATUS, STATUS_TEXT.get(shown, status))
+            color = theme.status_color(shown)
             if color:
-                item.setForeground(1, QColor(color))
-            item.setData(2, Qt.UserRole, status)
+                item.setForeground(_COL_STATUS, QColor(color))
+            item.setData(_COL_STATUS, _STATUS_ROLE, status)
 
             # 统计：老状态出队、新状态入队
             if old != status:
@@ -868,36 +991,84 @@ class MainWindow(QMainWindow):
 
             pwd = event.get("password_used")
             if pwd:
-                item.setText(2, pwd)
+                item.setText(_COL_PWD, pwd)
             err = event.get("error")
-            if err:
-                item.setText(4, err[:140])
-                item.setToolTip(4, err)
+            if delivery_error:
+                # 交付原因放信息列 + tooltip：它是唯一能指向"我上次那 5GB 去哪了"
+                # 的线索，不能只留在本次运行的 warnings 里随窗口一起消失。
+                item.setText(_COL_INFO, delivery_error[:140])
+                item.setToolTip(_COL_INFO, delivery_error)
+                item.setToolTip(_COL_STATUS, delivery_error)
+            elif err:
+                item.setText(_COL_INFO, err[:140])
+                item.setToolTip(_COL_INFO, err)
             if status == "extracting":
-                item.setText(3, "0%")
+                item.setText(_COL_PROG, "0%")
             elif status == "done":
-                item.setText(3, "100%")
+                item.setText(_COL_PROG, "—" if delivery_error else "100%")
             elif status == "failed":
-                item.setText(3, "—")
+                item.setText(_COL_PROG, "—")
         elif kind == "progress":
             pct = max(0, min(100, int(event.get("percent", 0))))
             self.progress.setValue(pct)
             self.progress_label.setText(f"{pct}%" if pct else "")
             item = self._task_items.get(event.get("task_id"))
             if item is not None:
-                item.setText(3, f"{pct}%")
+                item.setText(_COL_PROG, f"{pct}%")
         elif kind == "warning":
             self.statusBar().showMessage(f"警告：{event.get('message', '')}", 8000)
+
+    def _apply_archive_info(self, event: dict) -> None:
+        """把探测到的包体信息写进「类型 / 大小」两列。
+
+        加密封包头（-mhe=on）拿不到 7z 的 `Type`，此时 core 已用 magic 兜底；
+        真兜不出来才显示 "—"，不编造。
+        """
+        item = self._task_items.get(event.get("task_id"))
+        if item is None:
+            return  # 任务已不在树上（如新一轮已清空），静默丢弃
+
+        fmt = (event.get("format") or "").strip()
+        encrypted = bool(event.get("encrypted"))
+        item.setText(_COL_TYPE, fmt or "—")
+        # 加密包的类型用警示色标出——扫一眼就知道这行需要密码
+        item.setForeground(_COL_TYPE, QColor(theme.WARN if encrypted else theme.TEXT_MUTED))
+        item.setToolTip(
+            _COL_TYPE, f"格式：{fmt or '未知'}" + ("　已加密" if encrypted else ""))
+
+        item.setText(_COL_SIZE, human_size(event.get("archive_size") or 0))
+        item.setToolTip(_COL_SIZE, self._size_tooltip(event))
+
+    @staticmethod
+    def _size_tooltip(event: dict) -> str:
+        """大小列的补充说明：压缩包本体 + 解压后大小 + 文件数（探不到的项不编）。"""
+        size = human_size(event.get("archive_size") or 0)
+        # 分卷包的大小是**整组**之和，比用户拖进来的那个 .001 文件大得多。
+        # 不写明卷数，用户会以为这次又算错了——正是他反馈过的问题。
+        volumes = event.get("volumes") or 1
+        parts = [f"压缩包 {size}（{volumes} 个分卷）" if volumes > 1
+                 else f"压缩包 {size}"]
+        # bzip2/xz 这类流式格式 7z 报不出解压后大小（值为 0），
+        # 此时宁可不说，也不能写成"解压后 0 B"。
+        if event.get("uncompressed"):
+            parts.append(f"解压后 {human_size(event['uncompressed'])}")
+        if event.get("files"):
+            parts.append(f"{human_count(event['files'])} 个文件")
+        return " · ".join(parts)
 
     def _on_finished(self, report) -> None:
         self.start_btn.setEnabled(True)
         self.start_btn.setText("开始解压")
         n = len(self.input_list.real_paths())
         tail = f" · 跳过 {report.skipped}" if report.skipped else ""
+        if getattr(report, "delivery_failed", 0):
+            tail += f" · 未交付 {report.delivery_failed}"
         self.subtitle.setText(f"{n} 个输入 · 成功 {report.done}{tail}")
         line = f"完成：成功 {report.done} | 失败 {report.failed} | 待密码 {report.needs_password}"
         if report.skipped:
             line += f" | 已跳过 {report.skipped}"
+        if getattr(report, "delivery_failed", 0):
+            line += f" | 未交付 {report.delivery_failed}"
         self.statusBar().showMessage(line, 0)
 
         # 全部输入都被跳过时，界面上没有任何新产物——必须明确解释，
@@ -923,10 +1094,27 @@ class MainWindow(QMainWindow):
                 f"以下压缩包已跳过（密码不匹配）：\n{names}\n\n"
                 f"可点右下角「打开密码库」补充密码后重新解压。",
             )
+        delivery_failed = getattr(report, "delivery_failed", 0)
+        if delivery_failed:
+            # 必须弹窗，不能只落在状态栏里：这是最容易误判成"已经好了"的情况——
+            # 任务树显示完成、库里记着 done，而用户的目标目录里什么都没有。
+            failed = getattr(report, "delivery_failed_tasks", [])
+            names = "\n".join(f"· {Path(t.archive_path).name}" for t in failed[:10])
+            more = f"\n…… 另 {len(failed) - 10} 个" if len(failed) > 10 else ""
+            first = failed[0].delivery_error if failed else ""
+            QMessageBox.warning(
+                self, "有产物没能交付",
+                f"{delivery_failed} 个包**已经解压成功**，但产物没能交付到目标位置，"
+                f"现在仍留在隔离工作目录里：\n\n{names}{more}\n\n"
+                f"原因：{first}\n\n"
+                f"这些任务在列表里标为「未交付」。可以到下方「工作目录 → 查看/清理」"
+                f"里查看它们占了多少空间。",
+            )
         if report.warnings:
             # 复制失败/同名避让这类非致命问题只提示，不打断
             self.statusBar().showMessage(f"注意：{report.warnings[0]}", 10000)
         self._refresh_vault_label()
+        self._refresh_workdir_label()
 
     def _on_failed(self, message: str) -> None:
         self.start_btn.setEnabled(True)

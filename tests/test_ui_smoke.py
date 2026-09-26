@@ -25,8 +25,11 @@ def test_main_window_smoke(app):
     win = MainWindow()
     try:
         assert "解压开镜" in win.windowTitle()
-        # 7 列精简为 5 列：ID/层 已并入信息列（设计决策）
-        assert win.tree.columnCount() == 5
+        # 7 列 = 压缩包/类型/大小/状态/密码/进度/信息
+        # （早先把 7 列精简为 5 列：ID/层 并入信息列；后来又加回类型/大小两列，
+        #   那是用户明确要看的包体信息，与当初被砍掉的 ID/层 不是一回事。
+        #   列名与顺序的守卫见 tests/test_ui_info_columns.py）
+        assert win.tree.columnCount() == 7
         assert win.input_list.real_paths() == []
         assert win.start_btn.isEnabled()
     finally:

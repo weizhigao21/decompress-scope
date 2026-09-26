@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 # ---------- 设计令牌 ----------
 
 CANVAS = "#0D1117"      # 窗口底
@@ -38,8 +40,41 @@ STATUS_COLORS: dict[str, str] = {
     "failed": ERR,
 }
 
+# 「已完成但产物未交付」是**界面呈现态**，不是任务状态：core 里这些任务的
+# status 就是 done（解压确实成功了），只是 delivery_error 非空。
+#
+# 刻意不塞进 STATUS_COLORS：那张表的键必须与 core.models.TaskStatus 一一对应
+# （test_ui_smoke 里有守卫钉着），混入非状态值会让它不再是"状态表"。
+UNDELIVERED = WARN
+
+
+def status_color(state: str) -> str:
+    """任务树状态列取色。入参可以是真实状态，也可以是 done_undelivered。
+
+    用警示色而不是 OK/ERR 表达未交付：「解出来但没到你手里」既不是成功，
+    也不等于失败——判失败会让用户跑去重新解压一个其实已经解好的包。
+    """
+    if state == "done_undelivered":
+        return UNDELIVERED
+    return STATUS_COLORS.get(state, "")
+
 FONT_FAMILY = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif'
 FONT_MONO = '"Cascadia Mono", "Consolas", "JetBrains Mono", monospace'
+
+# ---------- 资源 ----------
+
+_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
+
+def asset_url(name: str) -> str:
+    """资源文件在 QSS 里的 url() 写法。
+
+    两个必须踩对的点：
+    - QSS 的相对路径是按**进程工作目录**解析的（不是相对本文件），所以必须给
+      绝对路径，否则换个目录启动就找不到图标；
+    - Windows 的反斜杠在 QSS 字符串里是转义符，必须用 as_posix() 转成正斜杠。
+    """
+    return (_ASSETS_DIR / name).as_posix()
 
 
 def build_stylesheet() -> str:
@@ -170,6 +205,28 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
 QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
     background-color: #38455A;
 }}
+/* 箭头必须显式给图：一旦给 ::up-button/::down-button 设了背景，Qt 就不再画
+   默认箭头，只留一块纯色 —— 表现就是「有灰条没三角」。 */
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    image: url("{asset_url('arrow_up.svg')}");
+    width: 10px;
+    height: 6px;
+}}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image: url("{asset_url('arrow_down.svg')}");
+    width: 10px;
+    height: 6px;
+}}
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled,
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+    image: none;
+}}
+/* 下拉框改用同一套三角，不再依赖 Fusion 的默认图标，视觉与数字框一致 */
+QComboBox::down-arrow {{
+    image: url("{asset_url('arrow_down.svg')}");
+    width: 10px;
+    height: 6px;
+}}
 
 /* ===== 复选框 ===== */
 QCheckBox {{ spacing: 7px; color: {TEXT_MUTED}; }}
@@ -184,7 +241,100 @@ QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
 QCheckBox::indicator:checked {{
     background-color: {ACCENT};
     border-color: {ACCENT};
+    /* 同理：设了背景就必须自己给出图形，否则只剩一个蓝方块 */
+    image: url("{asset_url('check.svg')}");
 }}
+QCheckBox::indicator:checked:disabled {{
+    background-color: {LINE};
+    border-color: {LINE};
+    image: none;
+}}
+
+/* 危险开关：警示只在「真的打开」那一刻出现——未勾选时它什么也没做，
+   挂着红字只会制造常驻噪音、让真正的危险被稀释。
+   （此前 QCheckBox[danger="true"] 一条规则都没有，这个属性是死的：
+     「完成后删除原始压缩包」全程零警示。） */
+QCheckBox[danger="true"]::indicator:checked {{
+    background-color: {ERR};
+    border-color: {ERR};
+}}
+QCheckBox[danger="true"]:checked {{ color: {ERR}; }}
+
+/* 列表/树里的复选框（如工作目录残留窗口的选择列）。
+   必须自己给图形：QCheckBox::indicator 那套**不覆盖** item view 的指示器，
+   不给就落到平台默认样式——Fusion 在暗色底上只画一个近同色的方框，
+   勾选态长什么样完全取决于平台（Ubuntu 的 Qt 又是另一套观感）。
+   这里复用与 QCheckBox 完全相同的画法，两处观感才能一致。 */
+QTreeView::indicator, QTreeWidget::indicator,
+QTableView::indicator, QListView::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {LINE};
+    border-radius: 4px;
+    background-color: {RAISED};
+}}
+QTreeView::indicator:hover, QTreeWidget::indicator:hover,
+QTableView::indicator:hover, QListView::indicator:hover {{
+    border-color: {ACCENT};
+}}
+QTreeView::indicator:checked, QTreeWidget::indicator:checked,
+QTableView::indicator:checked, QListView::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    image: url("{asset_url('check.svg')}");
+}}
+QTreeView::indicator:checked:disabled, QTreeWidget::indicator:checked:disabled,
+QTableView::indicator:checked:disabled, QListView::indicator:checked:disabled {{
+    background-color: {LINE};
+    border-color: {LINE};
+    image: none;
+}}
+
+/* ===== 设置窗口：左侧模块导航 ===== */
+/* 导航用「亮度台阶」表达选中：底板 SURFACE(#161B22)、选中项 RAISED(#1F2630)。
+   刻意不动用 ACCENT —— 强调色只留给主操作（保存）与进度。 */
+QListWidget#settingsNav {{
+    background-color: {SURFACE};
+    border: none;
+    border-right: 1px solid {LINE};
+    border-radius: 0;
+    padding: 12px 10px;
+    outline: none;
+}}
+QListWidget#settingsNav::item {{
+    padding: 9px 12px;
+    border-radius: 7px;
+    color: {TEXT_MUTED};
+}}
+QListWidget#settingsNav::item:hover {{
+    background-color: {LINE_SOFT};
+    color: {TEXT};
+}}
+QListWidget#settingsNav::item:selected {{
+    background-color: {RAISED};
+    color: {TEXT};
+    font-weight: 500;
+}}
+
+/* 设置页：页面自身滚动，操作条不滚（short 屏上「保存」必须始终够得着） */
+QScrollArea[role="page"] {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea[role="page"] > QWidget > QWidget {{ background: transparent; }}
+
+QLabel[role="pageTitle"] {{
+    background: transparent;
+    color: {TEXT};
+    font-size: 15px;
+    font-weight: 600;
+}}
+QLabel[role="pageDesc"], QLabel[role="hint"] {{
+    background: transparent;
+    color: {TEXT_FAINT};
+    font-size: 12px;
+}}
+QLabel[role="fieldLabel"] {{ background: transparent; color: {TEXT_MUTED}; }}
 
 /* ===== 列表 / 树 ===== */
 QListWidget, QTreeWidget, QTreeView {{
@@ -281,4 +431,9 @@ QPushButton[ghost="true"][danger="true"]:hover {{
 /* 统计卡：数字与标签透明融入面板，不叠加异色底 */
 QLabel[stat="value"] {{ background: transparent; }}
 QLabel[stat="label"] {{ background: transparent; color: {TEXT_FAINT}; font-size: 12px; }}
+
+/* 头部版本号：弱色小字。
+   字号**必须**在 QSS 里给——`QWidget {{ font-size: 13px; }}` 优先级高于
+   `setFont()`，代码里 setPointSize 会被整个覆盖，版本号会跟产品名一样大。 */
+QLabel[role="version"] {{ background: transparent; color: {TEXT_FAINT}; font-size: 11px; }}
 """
