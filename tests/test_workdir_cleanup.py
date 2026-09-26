@@ -101,7 +101,7 @@ def test_iter_task_dirs_missing_workdir_is_empty(tmp_path):
 def test_delivered_copy_is_cleanable(tmp_path):
     """产物已交付到工作目录之外：工作目录里这份是副本，可清理。"""
     wd = _mk_workdir(tmp_path)
-    final = tmp_path / "downloads" / "_解压开镜" / "pack"
+    final = tmp_path / "downloads" / "pack"
     final.mkdir(parents=True)
     store, (tid,) = _store_with(tmp_path, [{"extracted_dir": str(final)}])
     _mk_task_dir(wd, tid)

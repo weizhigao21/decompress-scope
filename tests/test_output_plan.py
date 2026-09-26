@@ -21,21 +21,43 @@ def _task(tmp_path: Path, name: str = "pack.zip", depth: int = 0, tid: int = 1) 
 
 
 def test_samedir_extracts_next_to_archive(tmp_path):
-    """samedir：解到 <源目录>/<_解压开镜>/<包名>/。"""
+    """samedir：解到 <源目录>/<包名>/（默认不建容器层）。"""
     cfg = _cfg(tmp_path)
     t = _task(tmp_path, "comic.cbz")
     plan = plan_output(t, cfg, OUTPUT_SAMEDIR)
 
-    expect = tmp_path / "src" / "_解压开镜" / "comic"
+    expect = tmp_path / "src" / "comic"
     assert plan.out_dir == expect
     assert plan.out_dir == plan.final_dir
     assert plan.copy_back is False
 
 
+def test_empty_subdir_name_lands_directly_in_source_dir(tmp_path):
+    """容器名留空 = 不要容器层：产物目录直接是 <源目录>/<包名>。
+
+    留空必须在这条分支上短路，不能落到 sanitize_component("") 的 "output" 兜底上
+    —— 那会在用户的下载目录里凭空建一个叫 output 的目录。
+    """
+    cfg = _cfg(tmp_path)
+    for empty in ("", "   "):
+        plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR,
+                           subdir_name=empty)
+        assert plan.out_dir == tmp_path / "src" / "comic", f"{empty!r}"
+        assert plan.out_dir.parent == tmp_path / "src", f"{empty!r} 多了一层容器"
+
+
+def test_explicit_subdir_name_still_adds_a_container_layer(tmp_path):
+    """容器层不是被删掉了，只是"默认不填"——填了照样多一层（能力保留）。"""
+    cfg = _cfg(tmp_path)
+    plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR,
+                       subdir_name="解压结果")
+    assert plan.out_dir == tmp_path / "src" / "解压结果" / "comic"
+
+
 def test_samedir_avoids_overwriting_existing(tmp_path):
     """同名目录已存在 → 自动避让为 "包名 (2)"，绝不覆盖既有产物。"""
     cfg = _cfg(tmp_path)
-    base = tmp_path / "src" / "_解压开镜" / "comic"
+    base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
 
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR)
@@ -51,7 +73,7 @@ def test_samedir_avoids_overwriting_existing(tmp_path):
 def test_samedir_overwrite_when_enabled(tmp_path):
     """显式开启 overwrite_existing 时直接复用同名目录。"""
     cfg = _cfg(tmp_path, overwrite_existing=True)
-    base = tmp_path / "src" / "_解压开镜" / "comic"
+    base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR)
     assert plan.out_dir == base
@@ -60,7 +82,7 @@ def test_samedir_overwrite_when_enabled(tmp_path):
 def test_samedir_force_new_ignores_overwrite_flag(tmp_path):
     """force_new 优先于全局开关（给"再解一份"用）。"""
     cfg = _cfg(tmp_path, overwrite_existing=True)
-    base = tmp_path / "src" / "_解压开镜" / "comic"
+    base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR, force_new=True)
     assert plan.out_dir.name == "comic (2)"
@@ -86,7 +108,7 @@ def test_workdir_mode_copies_back_to_source_dir(tmp_path):
     cfg = _cfg(tmp_path)
     plan = plan_output(_task(tmp_path, "pack.zip"), cfg, OUTPUT_WORKDIR)
     assert plan.out_dir == cfg.workdir / "task_1" / "out" / "pack"
-    assert plan.final_dir == tmp_path / "src" / "_解压开镜" / "pack"
+    assert plan.final_dir == tmp_path / "src" / "pack"
     assert plan.copy_back is True
 
 
@@ -147,15 +169,15 @@ def test_archive_without_suffix_uses_stem(tmp_path):
 def test_archive_stem_used_as_dirname_is_sanitized(tmp_path):
     """包名当目录名前必须消毒：`...zip` 的 stem 正好是 ".."。
 
-    拼出来是 `<源目录>/_解压开镜/..` —— 路径 normalize 后就是用户源目录本身，
+    拼出来是 `<源目录>/..` —— 路径 normalize 后就是用户源目录本身，
     产物会被平铺进下载目录（与盘符逃逸同族：都是把外部字符串直接当路径成分）。
     """
     cfg = _cfg(tmp_path)
     src = tmp_path / "src"
     for name in ("...zip", "..zip", "..."):
         plan = plan_output(_task(tmp_path, name), cfg, OUTPUT_SAMEDIR)
-        assert plan.out_dir.parent == src / "_解压开镜", (
-            f"{name!r} 逃出了容器目录：{plan.out_dir}"
+        assert plan.out_dir.parent == src, (
+            f"{name!r} 逃出了源目录：{plan.out_dir}"
         )
         assert plan.out_dir.name not in (".", ".."), f"{name!r} 产生了相对目录名"
     # 普通包名不受影响
@@ -209,7 +231,7 @@ def test_copy_back_flag_ignored_in_samedir_mode(tmp_path):
     """samedir 模式本就落源目录，copy_back 无意义，不应造成异常。"""
     cfg = _cfg(tmp_path)
     plan = plan_output(_task(tmp_path), cfg, OUTPUT_SAMEDIR, copy_back=False)
-    assert plan.out_dir == tmp_path / "src" / "_解压开镜" / "pack"
+    assert plan.out_dir == tmp_path / "src" / "pack"
     assert plan.final_dir == plan.out_dir
 
 

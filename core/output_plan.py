@@ -4,8 +4,9 @@
 - OUTPUT_WORKDIR：所有产物落到隔离工作目录 workdir/task_<id>/out（默认旧行为）。
   成功且无嵌套的内层任务，额外把结果同名复制回源压缩包所在目录（尽力而为，
   失败只记警告；源目录不可写、已存在同名、空间不足都不应让解压任务失败）。
-- OUTPUT_SAMEDIR：每个压缩包解到它自己旁边的子目录 <父目录>/<subdir>/<包名>/，
-  省掉跨盘复制，也符合「解压到压缩包目录」的直觉。
+- OUTPUT_SAMEDIR：每个压缩包解到它自己旁边的 <包名>/ 目录。`subdir_name` 留空
+  （默认）时基准就是压缩包所在目录，即 `<源目录>/<包名>/`；填了容器名才多一层
+  `<源目录>/<容器名>/<包名>/`。省掉跨盘复制，也符合「解压到压缩包目录」的直觉。
 
 嵌套的内层压缩包一律留在 workdir 内展开（它们是中间产物，不属于最终交付），
 最终落点由最外层任务决定；它们的**包名会保留成一级目录名**，见
@@ -42,9 +43,9 @@ def archive_dir_name(archive) -> str:
     内层包与最外层包都用它命名产物目录，所以必须是同一个函数——两处各写一份
     迟早会漂移出两种叫法。
 
-    绝不能直接把 stem 当目录名：`...zip` 的 stem 正好是 `".."`，拼进
-    `<源目录>/_解压开镜/` 之后路径 normalize 回来就是**源目录本身**，产物会被
-    平铺进用户的下载目录。与盘符逃逸同族——都是把外部字符串直接当路径成分。
+    绝不能直接把 stem 当目录名：`...zip` 的 stem 正好是 `".."`，拼进源目录后
+    路径 normalize 回来就是**源目录本身**，产物会被平铺进用户的下载目录。
+    与盘符逃逸同族——都是把外部字符串直接当路径成分。
     """
     return sanitize_component(Path(archive).stem)
 
@@ -90,7 +91,7 @@ def same_volume(a: Path, b: Path) -> bool:
 def plan_output(    task,
     cfg,
     mode: str,
-    subdir_name: str = "_解压开镜",
+    subdir_name: str = "",
     force_new: bool = False,
     copy_back: bool = True,
 ) -> OutputPlan:
@@ -101,25 +102,32 @@ def plan_output(    task,
     对应位置。内层包的包名因此在最终产物里留下一级目录，而不是被拍平丢掉。
 
     - 嵌套任务（depth > 0）恒在 workdir 内展开：它们是中间产物，不属于最终交付。
-    - samedir 模式 + 最外层：直接解到 <源目录>/<subdir>/<包名>/。
+    - samedir 模式 + 最外层：直接解到 <源目录>/<包名>/。
     - workdir 模式 + 最外层 + copy_back：解到 workdir/task_<id>/out/<包名>，
-      成功后复制回 <源目录>/<subdir>/<包名>/（复制失败只警告，任务仍算成功）。
+      成功后复制回 <源目录>/<包名>/（复制失败只警告，任务仍算成功）。
     - workdir 模式 + 最外层 + 不 copy_back：纯隔离，源目录不动；工作目录里的
       产物同样带着包名，用户去翻工作目录时也能认出哪个目录是哪个包。
+
+    `subdir_name` 留空（默认）= **不要容器层**，产物直接落在压缩包所在目录；填了
+    才多一层 `<源目录>/<容器名>/`。空值必须在这里短路，不能让它落到
+    sanitize_component 的 "output" 兜底上——那会在用户的下载目录里凭空建一个
+    output 目录。`appconfig.normalize()` 对空值的处理与这里保持同一套语义。
     """
     task_dir = Path(cfg.workdir) / f"task_{task.id}"
     archive = Path(task.archive_path)
     out_dir = task_dir / "out" / archive_dir_name(archive)
+    # 交付侧的基准目录：有容器名才多一层，留空则就是压缩包所在目录
+    container = sanitize_component(subdir_name) if (subdir_name or "").strip() else ""
+    anchor = archive.parent / container if container else archive.parent
 
     if mode != OUTPUT_SAMEDIR or task.depth > 0:
         target = None
         if task.depth == 0 and mode == OUTPUT_WORKDIR and copy_back:
-            target = archive.parent / sanitize_component(subdir_name) / archive_dir_name(archive)
+            target = anchor / archive_dir_name(archive)
         return OutputPlan(out_dir=out_dir, final_dir=target, copy_back=target is not None)
 
     # samedir 模式：直接在源目录旁解压
-    parent = archive.parent / sanitize_component(subdir_name)
-    base = parent / archive_dir_name(archive)
+    base = anchor / archive_dir_name(archive)
     if force_new or not cfg.overwrite_existing:
         final = unique_path(base)
     else:

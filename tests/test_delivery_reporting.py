@@ -158,7 +158,7 @@ def test_copy_back_failure_is_persisted(tmp_path, monkeypatch):
     task = _mk_task(store, archive_path=str(tmp_path / "downloads" / "pack.zip"),
                     depth=0, status=TaskStatus.DONE)
     out_dir = _mk_out_dir(cfg.workdir, task.id, "pack")
-    final = tmp_path / "downloads" / "_解压开镜" / "pack"
+    final = tmp_path / "downloads" / "pack"
     pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=final, copy_back=True)
     events = _events(pipe)
 
@@ -197,7 +197,7 @@ def test_successful_delivery_points_extracted_dir_at_target(tmp_path):
     task = _mk_task(store, archive_path=str(tmp_path / "downloads" / "pack.zip"),
                     depth=0, status=TaskStatus.DONE)
     out_dir = _mk_out_dir(cfg.workdir, task.id, "pack")
-    final = tmp_path / "downloads" / "_解压开镜" / "pack"
+    final = tmp_path / "downloads" / "pack"
     pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=final, copy_back=True)
 
     report = RunReport()

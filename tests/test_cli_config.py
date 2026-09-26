@@ -129,7 +129,7 @@ def test_extract_respects_samedir_flag(isolated_cli, tmp_path, capsys):
                    "--workdir", str(tmp_path / "wd"), "--no-config"])
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+    assert (src / "p" / "a.txt").is_file()
 
 
 def test_extract_workdir_only_does_not_copy_back(isolated_cli, tmp_path, capsys):
@@ -147,7 +147,7 @@ def test_extract_workdir_only_does_not_copy_back(isolated_cli, tmp_path, capsys)
     out = capsys.readouterr().out
     assert rc == 0, out
     assert list(wd.rglob("a.txt"))
-    assert not (src / "_解压开镜").exists()
+    assert not (src / "p").exists(), "纯隔离模式不该在源目录留下产物"
     # 源目录里只剩原来的压缩包
     assert sorted(p.name for p in src.iterdir()) == ["p.zip"]
 
@@ -168,7 +168,7 @@ def test_extract_workdir_mode_copies_back_by_default(isolated_cli, tmp_path, cap
     rc = cli.main(["extract", str(src), "--workdir", str(tmp_path / "wd")])
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+    assert (src / "p" / "a.txt").is_file()
 
 
 def test_extract_reads_output_mode_from_config(isolated_cli, tmp_path, capsys):
@@ -187,7 +187,7 @@ def test_extract_reads_output_mode_from_config(isolated_cli, tmp_path, capsys):
     rc = cli.main(["extract", str(src), "--workdir", str(tmp_path / "wd")])
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+    assert (src / "p" / "a.txt").is_file()
 
 
 def test_extract_no_config_ignores_file(isolated_cli, tmp_path, capsys):
@@ -207,7 +207,7 @@ def test_extract_no_config_ignores_file(isolated_cli, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0, out
     # 内置默认是 samedir
-    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+    assert (src / "p" / "a.txt").is_file()
 
 
 def test_extract_skips_done_on_rerun_and_force_overrides(isolated_cli, tmp_path, capsys):
@@ -229,18 +229,18 @@ def test_extract_skips_done_on_rerun_and_force_overrides(isolated_cli, tmp_path,
     rc1 = cli.main(args)
     out1 = capsys.readouterr().out
     assert rc1 == 0, out1
-    assert (src / "_解压开镜" / "p" / "a.txt").is_file()
+    assert (src / "p" / "a.txt").is_file()
 
     rc2 = cli.main(args)
     out2 = capsys.readouterr().out
     assert rc2 == 0, out2
     assert "跳过" in out2, f"重跑未报告跳过：{out2}"
-    assert not (src / "_解压开镜" / "p (2)").exists(), "重跑堆出了重复产物目录"
+    assert not (src / "p (2)").exists(), "重跑堆出了重复产物目录"
 
     rc3 = cli.main([*args, "--force"])
     out3 = capsys.readouterr().out
     assert rc3 == 0, out3
-    assert (src / "_解压开镜" / "p (2)" / "a.txt").is_file(), f"--force 未重新解压：{out3}"
+    assert (src / "p (2)" / "a.txt").is_file(), f"--force 未重新解压：{out3}"
 
 
 def test_extract_rejects_non_positive_timeout(isolated_cli, tmp_path, capsys):

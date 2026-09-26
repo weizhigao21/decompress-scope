@@ -44,19 +44,19 @@ def _make_zip(exe: Path, inputs: Path, name: str = "pack.zip") -> Path:
 
 
 def test_samedir_lands_next_to_archive(tmp_path):
-    """samedir：产物落在压缩包旁边的 _解压开镜/<包名>/，工作目录里不留东西。"""
+    """samedir：产物落在压缩包旁边的 <包名>/，工作目录里不留东西。"""
     exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
     archive = _make_zip(exe, inputs)
 
     report = pipe.run([inputs])
 
     assert report.done == 1 and report.failed == 0
-    landed = inputs / "_解压开镜" / "pack" / "note.txt"
+    landed = inputs / "pack" / "note.txt"
     assert landed.is_file(), f"产物未落到源目录旁；实际 {list(inputs.rglob('note.txt'))}"
     assert landed.read_text(encoding="utf-8") == "解压开镜 payload"
     # 隔离工作目录里不应残留 out 内容（samedir 模式没用它）
     assert not list(cfg.workdir.rglob("note.txt"))
-    assert report.output_dirs and Path(report.output_dirs[0]) == inputs / "_解压开镜" / "pack"
+    assert report.output_dirs and Path(report.output_dirs[0]) == inputs / "pack"
 
 
 def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
@@ -70,11 +70,11 @@ def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
     _make_zip(exe, inputs)
 
     pipe.run([inputs])
-    first = inputs / "_解压开镜" / "pack" / "note.txt"
+    first = inputs / "pack" / "note.txt"
     first.write_text("第一次的产物被改过", encoding="utf-8")
 
     pipe.run([inputs])
-    second_dir = inputs / "_解压开镜" / "pack (2)"
+    second_dir = inputs / "pack (2)"
     assert second_dir.is_dir()
     assert (second_dir / "note.txt").read_text(encoding="utf-8") == "解压开镜 payload"
     assert first.read_text(encoding="utf-8") == "第一次的产物被改过"
@@ -96,7 +96,7 @@ def test_rerun_skips_already_done_archive(tmp_path):
 
     assert second.skipped == 1, "已完成的包没被跳过，重跑又解了一遍"
     assert second.done == 0, "跳过的任务不该计入成功"
-    assert not (inputs / "_解压开镜" / "pack (2)").exists(), "重跑堆出了重复产物目录"
+    assert not (inputs / "pack (2)").exists(), "重跑堆出了重复产物目录"
     assert any("跳过" in w for w in second.warnings), \
         f"跳过必须给出可解释的提示，否则用户会以为程序没反应：{second.warnings}"
 
@@ -112,13 +112,13 @@ def test_rerun_reprocesses_after_output_removed(tmp_path):
     _make_zip(exe, inputs)
     pipe.run([inputs])
 
-    shutil.rmtree(inputs / "_解压开镜")  # 用户把产物删了
+    shutil.rmtree(inputs / "pack")  # 用户把产物删了
 
     report = pipe.run([inputs])
 
     assert report.skipped == 0, "产物已被删除却仍判定跳过，用户将拿不回产物"
     assert report.done == 1
-    assert (inputs / "_解压开镜" / "pack" / "note.txt").is_file()
+    assert (inputs / "pack" / "note.txt").is_file()
 
 
 def test_force_reprocess_extracts_again(tmp_path):
@@ -132,7 +132,7 @@ def test_force_reprocess_extracts_again(tmp_path):
 
     assert second.skipped == 0
     assert second.done == 1
-    assert (inputs / "_解压开镜" / "pack (2)" / "note.txt").is_file()
+    assert (inputs / "pack (2)" / "note.txt").is_file()
 
 
 def test_workdir_mode_copies_back_to_source_dir(tmp_path):
@@ -143,7 +143,7 @@ def test_workdir_mode_copies_back_to_source_dir(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 1
-    delivered = inputs / "_解压开镜" / "pack" / "note.txt"
+    delivered = inputs / "pack" / "note.txt"
     assert delivered.is_file(), "workdir 模式未把产物交付回源目录"
     assert delivered.read_text(encoding="utf-8") == "解压开镜 payload"
     # 同卷交付走 rename 而非复制：工作目录里不再留一份副本（省一倍写入与磁盘）。
@@ -167,7 +167,7 @@ def test_delivered_output_dir_points_at_real_path(tmp_path):
     d = Path(report.output_dirs[0])
     assert d.is_dir(), f"output_dirs 指向了不存在的路径：{d}"
     assert any(d.iterdir()), "output_dirs 指向了空目录"
-    assert d == inputs / "_解压开镜" / "pack"
+    assert d == inputs / "pack"
 
 
 def test_workdir_rerun_skips_after_same_volume_move(tmp_path):
@@ -187,7 +187,7 @@ def test_workdir_rerun_skips_after_same_volume_move(tmp_path):
 
     assert second.skipped == 1, "同卷交付后重跑未跳过（extracted_dir 未随搬走更新）"
     assert second.done == 0
-    assert not (inputs / "_解压开镜" / "pack (2)").exists()
+    assert not (inputs / "pack (2)").exists()
 
 
 def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):
@@ -212,7 +212,7 @@ def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):
     report = pipe.run([inputs])
 
     assert report.done == 1
-    delivered = inputs / "_解压开镜" / "pack"
+    delivered = inputs / "pack"
     assert (delivered / "note.txt").is_file(), "跨卷仍应交付到源目录"
     assert list(cfg.workdir.rglob("note.txt")), "跨卷交付必须保留工作目录副本兜底"
     assert Path(report.output_dirs[0]) == delivered, \
@@ -237,7 +237,7 @@ def test_workdir_copy_back_has_no_consumed_inner_zip(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     # 内层内容已进交付目录，且**带着自己的包名**（out_dir 末级就是包名目录）
     assert (delivered / "inner" / "deep.txt").is_file()
     assert not list(delivered.rglob("inner.zip")), \
@@ -277,7 +277,7 @@ def test_nested_lookalike_archive_is_not_pruned(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     # 真内层包已被消化，不该留
     assert not (delivered / "inner.zip").exists(), "已消化的内层包未被清理"
     # 用户放在子目录里的同名无关文件必须幸存
@@ -297,7 +297,7 @@ def test_workdir_mode_pure_isolation_leaves_source_untouched(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 1
-    assert not (inputs / "_解压开镜").exists(), "纯隔离模式不应在源目录建任何东西"
+    assert not (inputs / "pack").exists(), "纯隔离模式不应在源目录建任何东西"
     assert list(cfg.workdir.rglob("note.txt"))
     # 但产物仍要能被 UI 打开，故 output_dirs 必须指向工作目录里的真实产物
     assert len(report.output_dirs) == 1
@@ -309,7 +309,7 @@ def test_workdir_mode_skips_existing_target_with_warning(tmp_path):
     """目标已存在时跳过复制并告警，绝不覆盖用户既有文件，也不判任务失败。"""
     exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_WORKDIR)
     _make_zip(exe, inputs)
-    target = inputs / "_解压开镜" / "pack"
+    target = inputs / "pack"
     target.mkdir(parents=True)
     (target / "note.txt").write_text("用户自己的文件", encoding="utf-8")
 
@@ -336,14 +336,14 @@ def test_samedir_nested_inner_stays_in_workdir(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     # 内层产物已进外层交付目录，并保留内层包名那一级
     assert (delivered / "inner" / "deep.txt").is_file()
     assert (delivered / "inner" / "deep.txt").read_text(encoding="utf-8") == "inner"
     # 内层 zip 本身被清掉（中间产物不该交付给用户）
     assert not list(delivered.rglob("inner.zip"))
     # 源目录下不得出现内层包的独立输出目录
-    assert not (inputs / "_解压开镜" / "inner").exists()
+    assert not (inputs / "inner").exists()
     # workdir 里的内层壳目录也应被收干净
     assert not list(cfg.workdir.rglob("deep.txt"))
 
@@ -357,7 +357,10 @@ def test_failed_task_leaves_no_empty_dir_in_source(tmp_path):
     report = pipe.run([inputs])
 
     assert report.needs_password == 1
-    assert not (inputs / "_解压开镜").exists(), "失败任务留下了空壳目录"
+    assert not (inputs / "hush").exists(), "失败任务留下了空壳目录"
+    # 安全网：容器留空时 final_dir.parent 就是源目录本身。收空壳目录的逻辑一旦
+    # 越过这一层，删掉的是用户的下载目录——这条断言让那种事故立刻现形。
+    assert inputs.is_dir(), "收空壳目录越过了源目录：用户的下载目录被删了"
 
 
 def test_output_dirs_point_at_real_products(tmp_path):
@@ -383,7 +386,7 @@ def test_single_top_dir_is_flattened(tmp_path):
 
     pipe.run([inputs])
 
-    out = inputs / "_解压开镜" / "wrap"
+    out = inputs / "wrap"
     # 单层目录被提上来：直接能看到 a.txt，而不是 wrapped/a.txt
     if (out / "a.txt").is_file():
         assert not (out / "wrapped").exists()

@@ -57,7 +57,8 @@ class Pipeline:
         self._ask_password = None  # 可选问询回调: ask_password({"path": ...}) -> str | None
         # 输出落地策略（由 UI/CLI 注入；默认沿用旧的隔离工作目录行为）
         self.output_mode = OUTPUT_WORKDIR
-        self.subdir_name = "_解压开镜"
+        # 容器目录名：留空 = 产物直接落在压缩包所在目录，不再套一层容器
+        self.subdir_name = ""
         self.copy_back = True  # workdir 模式下是否复制一份回源目录
         self.skip_done = getattr(cfg, "skip_done", True)  # 重跑时跳过已成功解压的包
         self._plans: dict[int, OutputPlan] = {}
@@ -537,8 +538,8 @@ class Pipeline:
     def _discard_plan(self, plan: OutputPlan) -> None:
         """任务未成功：清掉空壳目录，别在用户源目录留下痕迹。
 
-        samedir 模式会连父级子目录一起收掉——若本轮所有任务都没成功，
-        <源目录>/_解压开镜/ 不该剩下（用户会以为解压成功了）。
+        samedir 模式会连父级容器目录一起收掉——若本轮所有任务都没成功，
+        <源目录>/<容器名>/ 不该剩下（用户会以为解压成功了）。
         只有当目录为空时才删，绝不碰用户已经放进去的文件。
         """
         if plan.final_dir is None:
@@ -553,14 +554,17 @@ class Pipeline:
         except OSError:
             return
 
-        # 往上收空壳父目录：只收名为 subdir_name 的那一层，绝不越过用户源目录
-        parent = plan.final_dir.parent
-        try:
-            if (parent.is_dir() and parent.name == self.subdir_name
-                    and not any(parent.iterdir())):
-                parent.rmdir()
-        except OSError:
-            pass
+        # 往上收空壳父目录：只在**确实有容器层**时（subdir_name 非空）收，且只收
+        # 名为它的那一层，绝不越过用户源目录。留空时 parent 就是压缩包所在目录
+        # 本身——那是用户的下载目录，无论如何都不能碰。
+        if self.subdir_name:
+            parent = plan.final_dir.parent
+            try:
+                if (parent.is_dir() and parent.name == self.subdir_name
+                        and not any(parent.iterdir())):
+                    parent.rmdir()
+            except OSError:
+                pass
 
 
     def _run_extract(self, task_id: int, archive: Path, out_dir: Path,

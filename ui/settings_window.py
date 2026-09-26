@@ -73,7 +73,7 @@ _AUTORUN_HINTS = {
     AUTORUN_CONFIRM: "拖入后弹窗确认真实数量，避免误拖整个磁盘。",
 }
 _OUTPUT_HINTS = {
-    OUTPUT_SAMEDIR: "每个压缩包解到它附近：<所在目录> / <容器目录> / <包名> /",
+    OUTPUT_SAMEDIR: "每个压缩包解到它附近：<所在目录> / <包名> /",
     OUTPUT_WORKDIR: "统一解到隔离工作目录，成功后按需复制一份回压缩包所在目录。",
 }
 
@@ -192,8 +192,11 @@ class SettingsWindow(QMainWindow):
                     self._stack(self.output_combo, self.output_hint))
 
         self.subdir_edit = QLineEdit()
-        self.subdir_edit.setPlaceholderText("_解压开镜")
-        self.subdir_edit.setToolTip("在压缩包所在目录下创建的容器目录名，避免产物散落一地")
+        self.subdir_edit.setPlaceholderText("留空 = 不建容器，产物直接落在压缩包所在目录")
+        self.subdir_edit.setToolTip(
+            "留空（默认）：解出 <所在目录>/<包名>/。\n"
+            "填了名字才会多一层 <所在目录>/<容器名>/<包名>/ —— "
+            "下载目录很乱、想把解压产物圈在一起时再填。")
         form.addRow(self._field_label("容器目录名"), self.subdir_edit)
 
         work_row = QWidget()
@@ -541,7 +544,7 @@ class SettingsWindow(QMainWindow):
         return replace(
             self._cfg,
             output_mode=self.output_combo.currentData() or OUTPUT_SAMEDIR,
-            subdir_name=self.subdir_edit.text().strip() or "_解压开镜",
+            subdir_name=self.subdir_edit.text().strip(),
             workdir=self.workdir_edit.text().strip(),
             overwrite_existing=self.overwrite_check.isChecked(),
             copy_back_to_source=self.copy_back_check.isChecked(),

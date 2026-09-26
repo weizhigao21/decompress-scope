@@ -130,7 +130,7 @@ class AppConfig:
     output_mode: str = OUTPUT_SAMEDIR
     copy_back_to_source: bool = True      # 仅 workdir 模式有意义
     workdir: str = ""                     # 空 = 默认 项目/.workspace
-    subdir_name: str = "_解压开镜"          # samedir 模式的子目录名，避免污染原目录
+    subdir_name: str = ""                   # 产物外的容器目录名；留空 = 不要这层容器
     overwrite_existing: bool = False      # False = 同名目录自动改名，绝不覆盖既有产物
 
     # --- 启动 ---
@@ -239,11 +239,14 @@ class AppConfig:
 
         self.workdir = (self.workdir or "").strip()
         self.password_source = (self.password_source or "").strip()
-        # 子目录名消毒复用 output_plan 的同一份实现，避免两处各写一份而漏掉盘符。
-        # 原值为空/纯非法字符时 sanitize 会给出兜底 "output"，这里换回用户可读的默认名。
+        # 容器目录名消毒复用 output_plan 的同一份实现，避免两处各写一份而漏掉盘符。
+        # **空值是有意义的**：表示不要容器层，产物直接落在压缩包所在目录。所以不能
+        # 像旧版那样把空值换回默认名——那会让"留空"这个表达永远无法生效。
+        # 这里刻意对空值短路、不去调 sanitize_component：它对空串会给出 "output"
+        # 兜底，直接采纳就会在用户的下载目录里凭空建一个叫 output 的目录。
+        # 反过来也不能拿 "output" 当"空"的信号——用户真填了这个名字是合法选择。
         raw_sub = (self.subdir_name or "").strip()
-        cleaned_sub = sanitize_component(raw_sub)
-        self.subdir_name = "_解压开镜" if cleaned_sub == "output" else cleaned_sub
+        self.subdir_name = sanitize_component(raw_sub) if raw_sub else ""
 
         self.autorun_delay_ms = int(max(0, min(10000, self.autorun_delay_ms)))
         for name in _CLAMP:

@@ -4,7 +4,7 @@
 或者可以设计一个保留全部的文件名还有它的层级。」
 
 选定「保留完整层级」。旧实现把内层包解在隔离目录后，**把内容拍平并入外层目录**：
-`新建压缩文件.zip`（内含 `内层真名.zip`）解出来是 `_解压开镜/新建压缩文件/内容`——
+`新建压缩文件.zip`（内含 `内层真名.zip`）解出来是 `新建压缩文件/内容`——
 内层包名彻底消失，用户拿到的东西看不出是从哪个包来的；一个外层套多个内层包时，
 各包内容更是全部糊在同一层。
 
@@ -87,7 +87,7 @@ def test_inner_archive_name_becomes_a_subdirectory(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2, report.warnings
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "内层真名" / "deep.txt").is_file(), (
         f"内层包名没成为目录；实际 {_tree(delivered)}"
     )
@@ -115,7 +115,7 @@ def test_inner_archive_keeps_its_original_subdir_position(tmp_path):
 
     pipe.run([inputs])
 
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "sub" / "inner" / "deep.txt").is_file(), (
         f"内层的相对位置没被保留；实际 {_tree(delivered)}"
     )
@@ -145,7 +145,7 @@ def test_three_levels_keep_the_full_chain(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 3, report.warnings
-    delivered = inputs / "_解压开镜" / "A"
+    delivered = inputs / "A"
     assert (delivered / "B" / "C" / "c.txt").is_file(), (
         f"三层名字没保留完整；实际 {_tree(delivered)}"
     )
@@ -172,7 +172,7 @@ def test_sibling_inner_archives_get_separate_dirs(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 3, report.warnings
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "B" / "b.txt").read_text(encoding="utf-8") == "from B"
     assert (delivered / "C" / "c.txt").read_text(encoding="utf-8") == "from C"
 
@@ -193,7 +193,7 @@ def test_inner_name_clash_does_not_overwrite(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2, report.warnings
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "inner" / "keep.txt").read_text(encoding="utf-8") == "kept"
     assert (delivered / "inner (2)" / "deep.txt").is_file(), (
         f"同名冲突时内层产物被吞掉；实际 {_tree(delivered)}"
@@ -211,9 +211,9 @@ def test_workdir_mode_keeps_hierarchy_after_copy_back(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2, report.warnings
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "内层真名" / "deep.txt").is_file(), _tree(delivered)
-    assert not list((inputs / "_解压开镜").rglob("*.zip")), "交付目录残留中间包"
+    assert not list((inputs / "outer").rglob("*.zip")), "交付目录残留中间包"
 
 
 def test_workdir_without_copy_back_keeps_hierarchy_in_workdir(tmp_path):
@@ -244,7 +244,7 @@ def test_keeping_intermediate_leaves_archive_beside_its_dir(tmp_path):
     report = pipe.run([inputs])
 
     assert report.done == 2, report.warnings
-    delivered = inputs / "_解压开镜" / "outer"
+    delivered = inputs / "outer"
     assert (delivered / "内层真名.zip").is_file(), "开关要求保留内层包，但它被删了"
     assert (delivered / "内层真名" / "deep.txt").is_file(), (
         f"内层包与它解出的目录没并存；实际 {_tree(delivered)}"
@@ -290,7 +290,7 @@ def test_failed_parent_does_not_materialize_inner_products(tmp_path):
     child_out.mkdir(parents=True)
     (child_out / "deep.txt").write_text("inner", encoding="utf-8")
     pipe._plans[1] = OutputPlan(out_dir=parent_out,
-                                final_dir=inputs / "_解压开镜" / "outer", copy_back=True)
+                                final_dir=inputs / "outer", copy_back=True)
     pipe._plans[2] = OutputPlan(out_dir=child_out)
 
     report = RunReport()

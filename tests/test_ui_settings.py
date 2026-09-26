@@ -106,10 +106,10 @@ def test_settings_collect_normalizes_over_range(app, tmp_path):
     win = SettingsWindow(_cfg(), tmp_path / "cfg.json", tmp_path)
     try:
         win.depth_spin.setValue(10)          # 控件上限
-        win.subdir_edit.setText("  ")        # 空白 → 回落默认
+        win.subdir_edit.setText("  ")        # 空白 → 不要容器层
         cfg = win._collect()
         assert cfg.max_depth == 10
-        assert cfg.subdir_name == "_解压开镜"
+        assert cfg.subdir_name == ""
     finally:
         win.close()
     app.processEvents()
@@ -525,7 +525,7 @@ def test_make_cfg_uses_preferences(app, tmp_path):
     from ui.main_window import MainWindow
 
     AppConfig(autorun_mode=AUTORUN_OFF, output_mode=OUTPUT_SAMEDIR,
-              max_total_gb=3, subdir_name="_解压开镜",
+              max_total_gb=3, subdir_name="",
               extract_timeout=1800, skip_done=False).save(main_window.CONFIG_PATH)
     win = MainWindow()
     try:

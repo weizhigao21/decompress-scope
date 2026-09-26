@@ -25,7 +25,8 @@ def test_defaults_are_sane(tmp_path):
     assert cfg.open_after == OPEN_PATHS
     assert cfg.open_after in OPEN_ITEMS
     assert cfg.recent_inputs == []
-    assert cfg.subdir_name == "_解压开镜"
+    # 默认不建容器层：产物直接落在压缩包所在目录
+    assert cfg.subdir_name == ""
 
 
 def test_roundtrip(tmp_path):
@@ -117,8 +118,22 @@ def test_normalize_subdir_name_blocks_escape():
     assert "/" not in cfg.subdir_name and "\\" not in cfg.subdir_name
     assert not cfg.subdir_name.startswith(".")
 
+    # 空白 = 不要容器层（不再是"回落默认名"——那样"留空"这个表达永远无法生效）
     cfg2 = AppConfig(subdir_name="   ").normalize()
-    assert cfg2.subdir_name == "_解压开镜"
+    assert cfg2.subdir_name == ""
+
+
+def test_normalize_empty_subdir_means_no_container():
+    """容器名留空 = 不要容器层，且**不能**被改回默认名。
+
+    旧实现把空值换回 "_解压开镜"，"留空"这个表达因此永远无法生效（用户清空输入框
+    保存后，界面显示空、实际却还在建容器）。反过来也不能拿 "output" 当"空"的信号
+    去吞掉——它是 sanitize_component 的兜底值，同时也是用户的合法选择。
+    """
+    assert AppConfig(subdir_name="").normalize().subdir_name == ""
+    assert AppConfig(subdir_name="   ").normalize().subdir_name == ""
+    assert AppConfig(subdir_name=None).normalize().subdir_name == ""
+    assert AppConfig(subdir_name="output").normalize().subdir_name == "output"
 
 
 def test_normalize_subdir_name_blocks_drive_letter():
@@ -134,7 +149,7 @@ def test_normalize_subdir_name_blocks_drive_letter():
 
 def test_from_dict_none_str_field_keeps_default():
     """JSON 里的 null 不能变成字面字符串 "None"（会在源目录建出叫 None 的目录）。"""
-    assert AppConfig.from_dict({"subdir_name": None}).subdir_name == "_解压开镜"
+    assert AppConfig.from_dict({"subdir_name": None}).subdir_name == ""
     assert AppConfig.from_dict({"workdir": None}).workdir == ""
     assert AppConfig.from_dict({"workdir": 12345}).workdir == ""
     assert AppConfig.from_dict({"output_mode": None}).output_mode == OUTPUT_SAMEDIR
