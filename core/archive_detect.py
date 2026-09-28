@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .embedded_zip import find_embedded_zip
+
 # (偏移, magic, 类型名) — 覆盖 zip / rar4+rar5 / 7z / gzip / bzip2 / xz / cab / wim / tar
 #
 # 类型名刻意与 7z `l -slt` 报出的 `Type` 取值对齐（zip/7z/tar/gzip/bzip2/xz/wim），
@@ -35,6 +37,10 @@ COMPOUND_ZIP_EXTS = frozenset({
 
 _READ_SIZE = 4096
 
+VIDEO_EXTS = frozenset({
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
+})
+
 # 已知"绝不可能是压缩包"的常见扩展名：命中即直接判否，**不读文件头**。
 #
 # 为什么需要：解压出的素材包里图片/视频动辄几万个，而嗅探对每个扩展名未命中
@@ -42,15 +48,13 @@ _READ_SIZE = 4096
 # 涨到 7.78s（+184%），其中绝大部分花在注定不是压缩包的文件上。
 #
 # 为什么这是安全的：这里只收"约定俗成不可能是压缩包"的类型。刻意**不收**
-# .dat / .bin / .img 这类常见伪装载体，也不收 .exe —— 它们仍走原有的 magic
-# 嗅探，因此"伪装成 .dat 的 zip"等能力不受影响。
+# .dat / .bin / .img / .exe 和视频后缀这类可能的伪装载体。
 _NOT_ARCHIVE_EXTS = frozenset({
     # 图片
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff",
     ".ico", ".svg", ".avif", ".heic", ".psd",
-    # 音视频
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
-    ".mpg", ".mpeg", ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".ape",
+    # 音频
+    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".ape",
     # 文本与文档
     ".txt", ".md", ".nfo", ".log", ".json", ".xml", ".csv", ".tsv",
     ".ini", ".cfg", ".yaml", ".yml", ".toml", ".pdf", ".rtf",
@@ -172,14 +176,18 @@ def sniff_format(path: Path) -> str:
 
     与 looks_like_archive 共用 magic 表与扩展名短路规则，理由见 _sniff。
     """
+    if path.suffix.lower() in VIDEO_EXTS:
+        return "zip" if find_embedded_zip(path) else _sniff(path)[1]
     if path.suffix.lower() in _NOT_ARCHIVE_EXTS:
         return ""
-    return _sniff(path)[1]
+    return _sniff(path)[1] or ("zip" if find_embedded_zip(path) else "")
 
 
 def looks_like_archive(path: Path) -> bool:
     """读取文件头 magic bytes 判断是否压缩包；无法读取/太小一律按否处理。"""
+    if path.suffix.lower() in VIDEO_EXTS:
+        return find_embedded_zip(path) is not None or bool(_sniff(path)[1])
     if path.suffix.lower() in _NOT_ARCHIVE_EXTS:
         # 已知非压缩类型：不碰磁盘。见 _NOT_ARCHIVE_EXTS 的说明。
         return False
-    return _sniff(path)[1] != ""
+    return _sniff(path)[1] != "" or find_embedded_zip(path) is not None

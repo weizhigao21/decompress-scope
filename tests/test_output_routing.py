@@ -1,4 +1,5 @@
 """输出落点端到端测试：真实 7z 验证 samedir / workdir 两种模式的产物位置。"""
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -133,6 +134,40 @@ def test_force_reprocess_extracts_again(tmp_path):
     assert second.skipped == 0
     assert second.done == 1
     assert (inputs / "pack (2)" / "note.txt").is_file()
+
+
+def test_changed_archive_is_not_skipped_even_when_output_exists(tmp_path):
+    """同一路径的包被替换后必须重新处理，不能复用旧 DONE 结论。"""
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    archive = _make_zip(exe, inputs)
+    assert pipe.run([inputs]).done == 1
+
+    stat = archive.stat()
+    os.utime(archive, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    report = pipe.run([inputs])
+    assert report.skipped == 0
+    assert report.done == 1
+
+
+def test_overwrite_failure_does_not_delete_existing_output(tmp_path):
+    """覆盖模式失败时，用户已有产物必须原样保留。"""
+    exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
+    payload = inputs / "note.txt"
+    payload.write_text("secret payload", encoding="utf-8")
+    _run7z(exe, ["a", "-pnot-in-candidates", "pack.zip", "note.txt"], inputs)
+    payload.unlink()
+    existing = inputs / "pack"
+    existing.mkdir()
+    keep = existing / "user-file.txt"
+    keep.write_text("keep me", encoding="utf-8")
+    cfg.overwrite_existing = True
+
+    report = pipe.run([inputs])
+
+    assert report.needs_password == 1
+    assert keep.read_text(encoding="utf-8") == "keep me"
+    assert not list(cfg.workdir.rglob("note.txt"))
 
 
 def test_workdir_mode_copies_back_to_source_dir(tmp_path):

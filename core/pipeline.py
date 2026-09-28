@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR
-from .archive_detect import COMPOUND_ZIP_EXTS, looks_like_archive, volume_info
+from .archive_detect import COMPOUND_ZIP_EXTS, VIDEO_EXTS, looks_like_archive, volume_info
+from .embedded_zip import find_embedded_zip, prepare_embedded_zip
 from .config import Config
 from .models import ArchiveInfo, AttemptOutcome, Task, TaskStatus
 from .output_plan import (
@@ -40,6 +41,7 @@ class RunReport:
     # 用户手上什么都没有"。
     delivery_failed: int = 0
     needs_password_tasks: list[Task] = field(default_factory=list)
+    failed_tasks: list[Task] = field(default_factory=list)
     skipped_tasks: list[Task] = field(default_factory=list)
     delivery_failed_tasks: list[Task] = field(default_factory=list)
     output_dirs: list[str] = field(default_factory=list)
@@ -62,6 +64,8 @@ class Pipeline:
         self.copy_back = True  # workdir 模式下是否复制一份回源目录
         self.skip_done = getattr(cfg, "skip_done", True)  # 重跑时跳过已成功解压的包
         self._plans: dict[int, OutputPlan] = {}
+        self._input_aliases: dict[str, str] = {}
+        self._joined_volume_paths: dict[int, set[Path]] = {}
         cfg.workdir.mkdir(parents=True, exist_ok=True)
 
 
@@ -139,7 +143,12 @@ class Pipeline:
         糟糕得多。所以产物目录的存在性是判据的一部分。
         """
         prev = self.store.find_done(archive_path)
-        if prev is None or not prev.extracted_dir:
+        if (
+            prev is None
+            or not prev.extracted_dir
+            or not prev.archive_fingerprint
+            or prev.archive_fingerprint != self._archive_fingerprint(Path(archive_path))
+        ):
             return None
         try:
             if Path(prev.extracted_dir).is_dir():
@@ -148,7 +157,56 @@ class Pipeline:
             return None
         return None
 
+    @staticmethod
+    def _archive_fingerprint(archive: Path) -> str:
+        """生成用于幂等跳过的轻量文件指纹。
+
+        分卷包必须包含整组卷的大小和修改时间：只记录首卷的话，后续分卷被
+        替换仍会错判成旧任务。读取元数据即可完成，不为跳过判定额外读取大文件。
+        文件在扫描后被删掉或无法 stat 时返回空串，调用方自然会重新处理。
+        """
+        try:
+            vi = volume_info(archive)
+            if vi is None:
+                stat = archive.stat()
+                return f"file:{stat.st_size}:{stat.st_mtime_ns}"
+            base, _ = vi
+            parts: list[tuple[int, str, int, int]] = []
+            for candidate in archive.parent.iterdir():
+                if not candidate.is_file():
+                    continue
+                member = volume_info(candidate)
+                if member is None or member[0].lower() != base.lower():
+                    continue
+                stat = candidate.stat()
+                parts.append((member[1], candidate.name.lower(), stat.st_size, stat.st_mtime_ns))
+            parts.sort()
+            return "volumes:" + "|".join(
+                f"{index}:{name}:{size}:{mtime}" for index, name, size, mtime in parts
+            )
+        except OSError:
+            return ""
+
     # ---------- 主流程 ----------
+
+    def _associated_embedded_inputs(self, path: Path) -> list[Path]:
+        """选中一个视频分卷载体时，只补入装着同组分卷的同目录载体。"""
+        bounds = find_embedded_zip(path)
+        groups = {vi[0] for name in (bounds.members if bounds else ())
+                  if (vi := volume_info(Path(name))) is not None}
+        if not groups:
+            return [path]
+        result = [path]
+        for sibling in sorted(path.parent.iterdir()):
+            if sibling == path or not sibling.is_file():
+                continue
+            if sibling.suffix.lower() not in (set(self.cfg.archive_exts) | VIDEO_EXTS):
+                continue
+            other = find_embedded_zip(sibling)
+            if other and any((vi := volume_info(Path(name))) and vi[0] in groups
+                             for name in other.members):
+                result.append(sibling)
+        return result
 
     def run(
         self,
@@ -174,6 +232,8 @@ class Pipeline:
         self._should_cancel = should_cancel
         self._ask_password = ask_password
         self._plans.clear()
+        self._input_aliases.clear()
+        self._joined_volume_paths.clear()
         report = RunReport()
         run_tasks: list[Task] = []
         queue: deque[Task] = deque()
@@ -187,7 +247,7 @@ class Pipeline:
                 )
                 files = self._collapse_volumes(files, report)
             elif p.is_file():
-                files = self._collapse_volumes([p], report)
+                files = self._collapse_volumes(self._associated_embedded_inputs(p), report)
             else:
                 msg = f"路径不存在: {p}"
                 report.warnings.append(msg)
@@ -210,7 +270,12 @@ class Pipeline:
                         report.warnings.append(msg)
                         self._emit({"kind": "warning", "message": msg})
                         continue
-                task = Task(archive_path=key, depth=0, source=source or extract_source(f.name))
+                task = Task(
+                    archive_path=key,
+                    archive_fingerprint=self._archive_fingerprint(f),
+                    depth=0,
+                    source=source or extract_source(f.name),
+                )
                 task.id = self.store.create(task)
                 run_tasks.append(task)
                 queue.append(task)
@@ -258,7 +323,64 @@ class Pipeline:
         })
 
     def _process(self, task: Task, queue: deque[Task], run_tasks: list[Task], report: RunReport) -> None:
+        self._join_sibling_volumes(task, run_tasks)
+        original = Path(task.archive_path)
+        with prepare_embedded_zip(
+            original, self.cfg.workdir,
+            should_cancel=self._cancel_requested,
+            on_progress=lambda pct: self._emit({
+                "kind": "phase", "task_id": task.id, "percent": pct,
+                "path": str(original),
+                "message": f"正在恢复视频内嵌 ZIP… {pct}%",
+            }),
+        ) as archive:
+            self._input_aliases[str(archive)] = str(original)
+            try:
+                self._process_archive(task, queue, run_tasks, report, archive)
+            finally:
+                self._input_aliases.pop(str(archive), None)
+
+    def _join_sibling_volumes(self, task: Task, run_tasks: list[Task]) -> None:
+        """BFS 已解开外层载体后，把同组内层分卷放到首卷旁边供 7z 读取。"""
         archive = Path(task.archive_path)
+        vi = volume_info(archive)
+        if task.parent_id is None or vi is None or vi[1] != 1:
+            return
+        by_id = {t.id: t for t in run_tasks}
+
+        def source_folder(t: Task) -> Path:
+            while t.parent_id in by_id:
+                t = by_id[t.parent_id]
+            return Path(t.archive_path).parent
+
+        candidates: dict[int, set[Path]] = {}
+        for parent in run_tasks:
+            plan = self._plans.get(parent.id)
+            if (parent.status != TaskStatus.DONE or parent.depth != task.depth - 1
+                    or plan is None or source_folder(parent) != source_folder(task)):
+                continue
+            for member in plan.out_dir.rglob("*"):
+                other = volume_info(member)
+                if member.is_file() and other and other[0] == vi[0]:
+                    candidates.setdefault(other[1], set()).add(member)
+        consumed = {archive}
+        for index, paths in candidates.items():
+            if index == 1 or len(paths) != 1:
+                continue  # 同名组有歧义时不混用
+            source = next(iter(paths))
+            target = archive.parent / source.name
+            if source != target:
+                if target.exists():
+                    continue
+                try:
+                    os.link(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
+            consumed.update((source, target))
+        self._joined_volume_paths[task.id] = consumed
+
+    def _process_archive(self, task: Task, queue: deque[Task], run_tasks: list[Task],
+                         report: RunReport, archive: Path) -> None:
         self._set(task, TaskStatus.PROBING)
         try:
             info = probe(self.sz, archive)
@@ -282,7 +404,7 @@ class Pipeline:
             task.source, limit=self.cfg.max_password_attempts
         )
         candidates = build_candidates(
-            archive.name, task.source, vault_candidates
+            Path(task.archive_path).name, task.source, vault_candidates
         )[: self.cfg.max_password_attempts]
 
         plan = self._plan_for(task)
@@ -462,6 +584,11 @@ class Pipeline:
                     (anchor / rel).unlink(missing_ok=True)
                 except OSError:
                     pass
+                for volume in self._joined_volume_paths.get(t.id, set()):
+                    try:
+                        volume.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
             # out_dir 整个搬走后只剩空壳，顺手把 workdir 里的 task_<id>/out/ 两层
             # 空目录收掉，别攒垃圾（绝不越过 workdir 根，也绝不删非空目录）
@@ -542,6 +669,11 @@ class Pipeline:
         <源目录>/<容器名>/ 不该剩下（用户会以为解压成功了）。
         只有当目录为空时才删，绝不碰用户已经放进去的文件。
         """
+        # 覆盖模式的输出先在 workdir staging 区生成。失败时只能清这块
+        # 自己创建的目录，绝不能检查或删除 final_dir——它可能是用户原有目录。
+        if plan.out_dir != plan.final_dir:
+            shutil.rmtree(plan.out_dir, ignore_errors=True)
+            return
         if plan.final_dir is None:
             return
         try:
@@ -592,8 +724,8 @@ class Pipeline:
         attempts = [""]
         seen: set[str] = {""}
         for cand in candidates:
-            if cand and cand.lower() not in seen:
-                seen.add(cand.lower())
+            if cand and cand not in seen:
+                seen.add(cand)
                 attempts.append(cand)
         last_msg = ""
         for pwd in attempts:
@@ -613,15 +745,17 @@ class Pipeline:
             for _ in range(3):
                 manual = ""
                 try:
-                    manual = self._ask_password({"path": str(archive)}) or ""
+                    manual = self._ask_password({
+                        "path": self._input_aliases.get(str(archive), str(archive)),
+                    }) or ""
                 except Exception:
                     break
                 manual = manual.strip()
                 if not manual:
                     break
-                if manual.lower() in seen:
+                if manual in seen:
                     continue
-                seen.add(manual.lower())
+                seen.add(manual)
                 result = self._run_extract(task_id, archive, out_dir, manual)
                 if result is None:
                     return AttemptOutcome(message="用户取消", password_issue=False)
@@ -642,6 +776,7 @@ class Pipeline:
             p for p in out_dir.rglob("*")
             if p.is_file() and self._looks_like_archive(p)
         )
+        inner = self._collapse_volumes(inner, report)
         if not inner:
             return
         if task.depth >= self.cfg.max_depth:
@@ -652,6 +787,7 @@ class Pipeline:
         for p in inner:
             child = Task(
                 archive_path=str(p),
+                archive_fingerprint=self._archive_fingerprint(p),
                 parent_id=task.id,
                 depth=task.depth + 1,
                 source=task.source or extract_source(p.name),
@@ -706,7 +842,7 @@ class Pipeline:
                 continue
 
             # 目标已存在则避让到 "包名 (2)"，与前一份产物并存（绝不覆盖）
-            target = dst if not dst.exists() else unique_path(dst)
+            target = dst if plan.overwrite else (dst if not dst.exists() else unique_path(dst))
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self._place_tree(src, target)
@@ -767,6 +903,7 @@ class Pipeline:
                     report.output_dirs.append(t.extracted_dir)
             elif t.status == TaskStatus.FAILED:
                 report.failed += 1
+                report.failed_tasks.append(t)
             elif t.status == TaskStatus.NEEDS_PASSWORD:
                 report.needs_password += 1
                 report.needs_password_tasks.append(t)

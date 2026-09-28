@@ -39,8 +39,14 @@ def test_candidates_order_and_dedupe():
     cands = build_candidates("a[密码:zz].zip", "abc.com", ["abc.com", "zz", "xx"])
     assert cands[0] == "zz"
     assert cands.index("abc.com") < cands.index("xx")
-    lowers = [c.lower() for c in cands]
-    assert len(lowers) == len(set(lowers))
+    assert len(cands) == len(set(cands))
+
+
+def test_candidates_keep_case_distinct_passwords():
+    """密码大小写敏感；ABC 与 abc 不是重复候选。"""
+    cands = build_candidates("pack.zip", "", ["ABC", "abc"])
+    assert "ABC" in cands
+    assert "abc" in cands
 
 
 def test_source_derived_survives_truncation():

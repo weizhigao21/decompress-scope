@@ -131,7 +131,7 @@ class PasswordVault:
         seen: set[str] = set()
         ordered: list[str] = []
         for (pwd,) in cur.fetchall():
-            key = pwd.lower()
+            key = pwd
             if key not in seen:
                 seen.add(key)
                 ordered.append(pwd)

@@ -21,11 +21,12 @@ from core.appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR, AppConfig
 from core.config import Config
 from core.formatting import human_size
 from core.pipeline import Pipeline, RunReport
+from core.runtime_paths import runtime_data_root
 from core.store import TaskStore
 from core.vault import PasswordVault
 from core.workdir_cleanup import prune, scan_workdir
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = runtime_data_root(Path(__file__).resolve().parent)
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
@@ -200,6 +201,30 @@ def _cmd_config(args) -> int:
     return 0
 
 
+def _cmd_shell_install() -> int:
+    try:
+        from core.shell_menu import install_context_menu, menu_icon, quick_command
+
+        install_context_menu(quick_command(PROJECT_ROOT), menu_icon(PROJECT_ROOT))
+    except OSError as exc:
+        print(f"[错误] 安装右键菜单失败: {exc}")
+        return 2
+    print("已安装右键菜单：在压缩包或文件夹上右键可见「解压开镜」。")
+    return 0
+
+
+def _cmd_shell_uninstall() -> int:
+    try:
+        from core.shell_menu import uninstall_context_menu
+
+        uninstall_context_menu()
+    except OSError as exc:
+        print(f"[错误] 移除右键菜单失败: {exc}")
+        return 2
+    print("已移除「解压开镜」右键菜单。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _init_streams()
     parser = argparse.ArgumentParser(prog="jieya", description="解压开镜 — 多层压缩包自动处理")
@@ -250,12 +275,28 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("gui", help="启动图形界面(需要 PySide6)")
 
+    p_quick = sub.add_parser("quick", help=argparse.SUPPRESS)
+    p_quick.add_argument("path", help="Explorer 右键菜单传入的文件或目录")
+    sub.add_parser("shell-install", help="安装当前用户的「解压开镜」右键菜单")
+    sub.add_parser("shell-uninstall", help="移除当前用户的「解压开镜」右键菜单")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "gui":
         from ui.app import launch
 
         return launch()
+
+    if args.cmd == "quick":
+        from ui.app import launch_quick
+
+        return launch_quick([args.path])
+
+    if args.cmd == "shell-install":
+        return _cmd_shell_install()
+
+    if args.cmd == "shell-uninstall":
+        return _cmd_shell_uninstall()
 
     if args.cmd == "clean-workdir":
         return _cmd_clean_workdir(args)

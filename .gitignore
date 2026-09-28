@@ -6,6 +6,8 @@ __pycache__/
 venv/
 build/
 dist/
+# 由打包.bat 自动生成的 PyInstaller 配置
+/JieyaKaijing.spec
 
 # ---- 测试 ----
 .pytest_cache/

@@ -57,6 +57,14 @@ def test_candidates_limit_truncates_after_priority(tmp_path):
     v.close()
 
 
+def test_candidates_keep_case_distinct_passwords(tmp_path):
+    v = PasswordVault(tmp_path / "v.db")
+    v.add_manual("ABC")
+    v.add_manual("abc")
+    assert v.candidates_for() == ["ABC", "abc"]
+    v.close()
+
+
 def test_add_manual_ignore_dup(tmp_path):
     v = PasswordVault(tmp_path / "v.db")
     v.add_manual("m1", "s.com")

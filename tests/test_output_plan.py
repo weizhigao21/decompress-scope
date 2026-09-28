@@ -71,12 +71,15 @@ def test_samedir_avoids_overwriting_existing(tmp_path):
 
 
 def test_samedir_overwrite_when_enabled(tmp_path):
-    """显式开启 overwrite_existing 时直接复用同名目录。"""
+    """显式开启覆盖时，先暂存再交付到同名目录。"""
     cfg = _cfg(tmp_path, overwrite_existing=True)
     base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR)
-    assert plan.out_dir == base
+    assert plan.out_dir != base
+    assert plan.final_dir == base
+    assert plan.copy_back is True
+    assert plan.overwrite is True
 
 
 def test_samedir_force_new_ignores_overwrite_flag(tmp_path):

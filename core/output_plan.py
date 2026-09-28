@@ -29,6 +29,7 @@ class OutputPlan:
     out_dir: Path                              # 7z 实际写入的目录
     final_dir: Path | None = None              # 最终交付目录；None = 仅 out_dir
     copy_back: bool = False                    # out_dir 完成后同名复制到 final_dir
+    overwrite: bool = False                    # 交付时允许合并覆盖 final_dir 中的同名项
     warnings: list[str] = field(default_factory=list)
 
 
@@ -126,9 +127,21 @@ def plan_output(    task,
             target = anchor / archive_dir_name(archive)
         return OutputPlan(out_dir=out_dir, final_dir=target, copy_back=target is not None)
 
-    # samedir 模式：直接在源目录旁解压
+    # 覆盖模式也必须先解到工作目录。直接往用户已有目录写入后，密码错误、取消
+    # 或 7z 报错时无法区分“本次写入”与用户原有文件，清理现场会误删原文件。
+    # 成功后才把 staging 树交付到目标目录，保留覆盖同名项的既有语义。
     base = anchor / archive_dir_name(archive)
-    if force_new or not cfg.overwrite_existing:
+    if force_new:
+        final = unique_path(base)
+        return OutputPlan(out_dir=final, final_dir=final)
+    if cfg.overwrite_existing:
+        return OutputPlan(
+            out_dir=out_dir,
+            final_dir=base,
+            copy_back=True,
+            overwrite=True,
+        )
+    if not cfg.overwrite_existing:
         final = unique_path(base)
     else:
         final = base

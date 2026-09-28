@@ -59,6 +59,13 @@ from core.appconfig import (
 )
 from core.formatting import human_size
 from core.workdir_cleanup import iter_task_dirs
+from core.shell_menu import (
+    install_context_menu,
+    is_context_menu_installed,
+    menu_icon,
+    quick_command,
+    uninstall_context_menu,
+)
 from ui import theme
 from ui.workdir_window import WorkdirWindow
 
@@ -228,6 +235,13 @@ class SettingsWindow(QMainWindow):
             "关闭时（推荐）遇到同名目录自动改名为「xxx (2)」，绝不覆盖既有产物")
         form2.addRow(self._field_label("同名产物"), self.overwrite_check)
 
+        self.context_menu_check = QCheckBox("在资源管理器右键菜单显示“解压开镜”")
+        self.context_menu_check.setToolTip(
+            "勾选后，右键任意文件或文件夹都可直接自动解压；取消勾选会移除该菜单。"
+            "此项立即生效，不需要点保存。")
+        self.context_menu_check.toggled.connect(self._on_context_menu_toggled)
+        form2.addRow(self._field_label("右键菜单"), self.context_menu_check)
+
         col.addSpacing(6)
         col.addWidget(self._build_residue_panel())
 
@@ -351,8 +365,8 @@ class SettingsWindow(QMainWindow):
         """纯开关页：整页只有开关，所以不必担心哪个控件被误读成上一行的附属说明。"""
         form = self._form(col, spacing=14)
 
-        self.sniff_check = QCheckBox("嗅探伪装压缩包（扩展名不认识时读文件头）")
-        self.sniff_check.setToolTip("扩展名不认识时读 magic bytes 判断是否压缩包")
+        self.sniff_check = QCheckBox("识别伪装压缩包和视频中的内嵌 ZIP")
+        self.sniff_check.setToolTip("读取文件头和视频尾部的 ZIP 目录，识别改后缀或视频外壳压缩包")
         form.addRow(self._field_label("文件识别"), self.sniff_check)
 
         self.skip_done_check = QCheckBox("跳过已成功解压且产物仍在的包")
@@ -516,6 +530,9 @@ class SettingsWindow(QMainWindow):
         self.workdir_edit.setText(cfg.workdir)
         self.overwrite_check.setChecked(cfg.overwrite_existing)
         self.copy_back_check.setChecked(cfg.copy_back_to_source)
+        self.context_menu_check.blockSignals(True)
+        self.context_menu_check.setChecked(is_context_menu_installed())
+        self.context_menu_check.blockSignals(False)
 
         self.delay_spin.setValue(cfg.autorun_delay_ms)
         self.remember_check.setChecked(cfg.remember_inputs)
@@ -666,6 +683,25 @@ class SettingsWindow(QMainWindow):
     def _on_output_changed(self, _i: int) -> None:
         self.output_hint.setText(_OUTPUT_HINTS.get(self.output_combo.currentData(), ""))
         self._sync_output_dependents()
+
+    def _on_context_menu_toggled(self, enabled: bool) -> None:
+        """右键菜单是系统集成，不是延迟到「保存」才生效的应用偏好。"""
+        try:
+            if enabled:
+                install_context_menu(
+                    quick_command(self._project_root), menu_icon(self._project_root),
+                )
+                self.statusBar().showMessage("已启用资源管理器右键菜单", 5000)
+            else:
+                uninstall_context_menu()
+                self.statusBar().showMessage("已移除资源管理器右键菜单", 5000)
+        except OSError as exc:
+            # 注册表写失败时必须还原勾选状态；保留“已开启”的视觉会让用户以为
+            # 下次右键一定能看到入口，实际却没有。
+            self.context_menu_check.blockSignals(True)
+            self.context_menu_check.setChecked(not enabled)
+            self.context_menu_check.blockSignals(False)
+            QMessageBox.critical(self, "右键菜单设置失败", str(exc))
 
     def _on_autorun_changed(self, _i: int) -> None:
         self.autorun_hint.setText(_AUTORUN_HINTS.get(self.autorun_combo.currentData(), ""))

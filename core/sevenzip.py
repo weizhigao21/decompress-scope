@@ -7,6 +7,7 @@ should_cancel() 返回 True 时杀掉 7z 进程（用于 UI 取消/退出）。
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import threading
@@ -15,6 +16,11 @@ from pathlib import Path
 
 _PROGRESS_RE = re.compile(r"(\d{1,3})%")
 _POLL_INTERVAL = 0.5
+
+
+def _creation_flags() -> int:
+    """GUI 启动 7z 时不弹出控制台；其他平台保持默认行为。"""
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 class SevenZipError(RuntimeError):
@@ -43,7 +49,10 @@ class SevenZip:
     def _run(self, args: list[str], timeout: float) -> tuple[int, str, str]:
         cmd = [self.exe, *args, "-y", "-sccUTF-8", "-spd"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            proc = subprocess.run(
+                cmd, capture_output=True, timeout=timeout,
+                creationflags=_creation_flags(),
+            )
         except subprocess.TimeoutExpired:
             raise SevenZipError(f"7z 执行超时({timeout:.0f}s): {args[0]} ...")
         except OSError as exc:
@@ -78,7 +87,10 @@ class SevenZip:
         cmd = [self.exe, "x", f"-o{dest}", f"-p{password}", str(archive),
                "-y", "-sccUTF-8", "-spd", "-bsp1"]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=_creation_flags(),
+            )
         except OSError as exc:
             raise SevenZipError(f"无法启动 7z: {exc}")
 

@@ -89,6 +89,9 @@ class AttemptOutcome:
 class Task:
     id: int | None = None
     archive_path: str = ""
+    # 入队时记录的文件（或完整分卷组）元数据。用于重跑判定：同一路径被
+    # 新下载内容替换后，不能因为旧的 DONE 记录而被静默跳过。
+    archive_fingerprint: str = ""
     parent_id: int | None = None
     depth: int = 0
     source: str = ""

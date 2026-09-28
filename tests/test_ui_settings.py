@@ -58,6 +58,7 @@ def test_settings_window_smoke(app, tmp_path):
         assert win.residue_label.text() in {"无残留", "0 项残留"}
         assert win.residue_open_btn.property("ghost") == "true"
         assert not win.residue_open_btn.property("primary"), "不许有第二个 primary"
+        assert win.context_menu_check.text().startswith("在资源管理器右键菜单")
     finally:
         win.close()
     app.processEvents()
@@ -94,6 +95,28 @@ def test_settings_collect_roundtrip(app, tmp_path):
         assert cfg.skip_done is False
         assert cfg.extract_timeout == 7200
         assert cfg.password_source == "example.com", "来源两端空白应被规范化掉"
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_context_menu_checkbox_applies_immediately(app, tmp_path, monkeypatch):
+    """右键菜单是系统操作：勾选/取消立刻写注册表，不必另点保存。"""
+    from ui import settings_window
+    from ui.settings_window import SettingsWindow
+
+    calls = []
+    monkeypatch.setattr(settings_window, "is_context_menu_installed", lambda: False)
+    monkeypatch.setattr(settings_window, "quick_command", lambda root: '"app" quick "%1"')
+    monkeypatch.setattr(settings_window, "menu_icon", lambda root: '"app.exe",0')
+    monkeypatch.setattr(settings_window, "install_context_menu", lambda *args: calls.append(args))
+    monkeypatch.setattr(settings_window, "uninstall_context_menu", lambda: calls.append("remove"))
+    win = SettingsWindow(_cfg(), tmp_path / "cfg.json", tmp_path)
+    try:
+        assert win.context_menu_check.isChecked() is False
+        win.context_menu_check.setChecked(True)
+        win.context_menu_check.setChecked(False)
+        assert calls == [('"app" quick "%1"', '"app.exe",0'), "remove"]
     finally:
         win.close()
     app.processEvents()

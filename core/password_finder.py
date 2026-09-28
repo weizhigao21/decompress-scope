@@ -41,8 +41,8 @@ def extract_passwords_from_name(name: str) -> list[str]:
     for pattern in _BRACKET_PATTERNS:
         for m in pattern.finditer(name):
             pwd = m.group(1).strip().strip("。.,，、 ")
-            if pwd and pwd.lower() not in seen:
-                seen.add(pwd.lower())
+            if pwd and pwd not in seen:
+                seen.add(pwd)
                 found.append(pwd)
     return found
 
@@ -81,7 +81,7 @@ def build_candidates(archive_name: str, source: str, vault_candidates: list[str]
     seen: set[str] = set()
 
     def add(pwd: str) -> None:
-        key = pwd.lower()
+        key = pwd
         if pwd and key not in seen:
             seen.add(key)
             candidates.append(pwd)

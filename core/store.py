@@ -10,6 +10,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     archive_path TEXT NOT NULL,
+    archive_fingerprint TEXT NOT NULL DEFAULT '',
     parent_id INTEGER,
     depth INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT '',
@@ -27,11 +28,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 # 必须显式 ALTER —— 否则老库一读就 "no such column: delivery_error"，
 # 而用户的库里恰恰躺着上次那批任务的记录（正是需要显示「未交付」的那批）。
 _COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("archive_fingerprint", "ALTER TABLE tasks ADD COLUMN archive_fingerprint TEXT NOT NULL DEFAULT ''"),
     ("delivery_error", "ALTER TABLE tasks ADD COLUMN delivery_error TEXT NOT NULL DEFAULT ''"),
 )
 
 _SELECT_COLS = (
-    "id, archive_path, parent_id, depth, source, status, password_used,"
+    "id, archive_path, archive_fingerprint, parent_id, depth, source, status, password_used,"
     " error, extracted_dir, delivery_error, created_at, updated_at"
 )
 
@@ -59,9 +61,10 @@ class TaskStore:
         task.created_at = now
         task.updated_at = now
         cur = self.conn.execute(
-            "INSERT INTO tasks(archive_path, parent_id, depth, source, status, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (task.archive_path, task.parent_id, task.depth, task.source, task.status.value, now, now),
+            "INSERT INTO tasks(archive_path, archive_fingerprint, parent_id, depth, source, status, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (task.archive_path, task.archive_fingerprint, task.parent_id, task.depth,
+             task.source, task.status.value, now, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -111,8 +114,8 @@ class TaskStore:
     @staticmethod
     def _to_task(row: tuple) -> Task:
         return Task(
-            id=row[0], archive_path=row[1], parent_id=row[2], depth=row[3], source=row[4],
-            status=TaskStatus(row[5]), password_used=row[6], error=row[7],
-            extracted_dir=row[8], delivery_error=row[9],
-            created_at=row[10], updated_at=row[11],
+            id=row[0], archive_path=row[1], archive_fingerprint=row[2], parent_id=row[3],
+            depth=row[4], source=row[5], status=TaskStatus(row[6]), password_used=row[7],
+            error=row[8], extracted_dir=row[9], delivery_error=row[10],
+            created_at=row[11], updated_at=row[12],
         )

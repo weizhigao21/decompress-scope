@@ -1,4 +1,5 @@
 """archive_detect 单元测试：magic bytes 嗅探与复合文档排除。"""
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,8 @@ from core.archive_detect import (
     volume_info,
 )
 from core.config import Config
-from core.pipeline import Pipeline
+from core.models import Task
+from core.pipeline import Pipeline, RunReport
 from core.store import TaskStore
 from core.vault import PasswordVault
 
@@ -253,6 +255,24 @@ def test_missing_first_volume_warned_and_skipped(tmp_path):
 
     assert pipe.store.list_all() == [], "缺少首卷的分卷不应入队"
     assert any("首卷" in w for w in report.warnings)
+
+
+def test_nested_part_volumes_collapse_to_single_task(tmp_path):
+    """内层扫描也必须归并 partNN 分卷，避免子任务重复入队。"""
+    pipe = _make_pipeline(tmp_path)
+    out_dir = tmp_path / "outer"
+    out_dir.mkdir()
+    for name in ("nested.part1.rar", "nested.part2.rar", "nested.part3.rar"):
+        (out_dir / name).write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+    parent = Task(id=1, archive_path=str(tmp_path / "outer.zip"), depth=0)
+    queue = deque()
+    run_tasks = [parent]
+    report = RunReport()
+
+    pipe._enqueue_children(parent, out_dir, queue, run_tasks, report)
+
+    assert len(queue) == 1
+    assert queue[0].archive_path.endswith("nested.part1.rar")
 
 
 # ---------- P1-1 嗅探短路：已知非压缩扩展名不读文件头 ----------

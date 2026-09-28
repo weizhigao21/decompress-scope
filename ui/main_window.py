@@ -50,6 +50,7 @@ from core.appconfig import (
     AppConfig,
 )
 from core.config import Config
+from core.runtime_paths import runtime_data_root
 from core.formatting import human_count, human_size
 from core.vault import PasswordVault
 from ui import theme
@@ -57,7 +58,7 @@ from ui.settings_window import SettingsWindow
 from ui.vault_window import VaultWindow
 from ui.worker import ExtractWorker
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = runtime_data_root(Path(__file__).resolve().parent.parent)
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
@@ -842,6 +843,9 @@ class MainWindow(QMainWindow):
                 item.setText(_COL_PROG, f"{pct}%")
         elif kind == "warning":
             self.statusBar().showMessage(f"警告：{event.get('message', '')}", 8000)
+        elif kind == "phase":
+            self.progress.setValue(int(event.get("percent", 0)))
+            self.statusBar().showMessage(event.get("message", "正在准备压缩包"))
 
     def _apply_archive_info(self, event: dict) -> None:
         """把探测到的包体信息写进「类型 / 大小」两列。
