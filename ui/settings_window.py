@@ -88,8 +88,8 @@ _OUTPUT_HINTS = {
 # 取「最大嵌套深度」（6 字 ≈ 78px）+ 余量，各页共用同一个值。
 _LABEL_W = 88
 
-# 单个密码候选的实测开销，用来给「密码尝试」估算最坏耗时。
-# 每次尝试都要新起一个 7z.exe（进程创建本身约 9 ms）并重新派生密钥
+# 未加速格式的单个密码候选实测开销，用来给「密码尝试」估算耗时。
+# RAR/7z 等格式每次尝试要新起一个 7z.exe 并重新派生密钥
 # （7z 格式 = SHA-256 迭代 2^19 轮），实测 19~31 ms，取 20 ms。
 # 实测方法与全部数据见 docs/extract-optimization-review.md 第四节。
 _MS_PER_CANDIDATE = 20
@@ -352,8 +352,8 @@ class SettingsWindow(QMainWindow):
             f"每个压缩包最多试几个候选密码（{_lo}–{_hi}），试完仍失败则标记「待密码」。\n\n"
             "它同时决定密码库能贡献几条：调大才会让库里靠后的条目轮到"
             "（库按「同来源 → 无来源 → 其他来源」排序，高命中率的排在前面）。\n\n"
-            "代价是每个候选都要让 7z 重新派生一次密钥，实测约 20 ms，"
-            "所以这个值直接决定单个需密码的包最坏要等多久。非加密包不受影响。")
+            "ZIP 会自动快速排除多数错误候选；其他格式每个候选仍需由 7-Zip 验证。"
+            "下方按未加速格式估算耗时，实际速度取决于格式、设备与密码。非加密包不受影响。")
         self.attempts_hint = self._hint()
         # 实时把"这个数字意味着等多久"摆在用户眼前。上限一旦放开，没有这行提示，
         # 用户会毫无察觉地把单包等待时间设成几十秒，然后以为程序卡死了。
@@ -592,8 +592,8 @@ class SettingsWindow(QMainWindow):
         n = self.attempts_spin.value()
         secs = n * _MS_PER_CANDIDATE / 1000.0
         self.attempts_hint.setText(
-            f"最坏 ≈ {secs:.1f} 秒/需密码的包（每个候选约 {_MS_PER_CANDIDATE} ms）；"
-            "非加密包不受影响。")
+            f"未加速格式参考 ≈ {secs:.1f} 秒/包（每个候选约 {_MS_PER_CANDIDATE} ms）；"
+            "ZIP 快速筛选通常更快，非加密包不受影响。")
 
     def _sync_output_dependents(self) -> None:
         """按输出模式启用/禁用只在某模式下才成立的开关。

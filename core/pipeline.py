@@ -24,6 +24,7 @@ from .output_plan import (
     unique_path,
 )
 from .password_finder import build_candidates, extract_source
+from .zip_password_filter import make_zip_password_filter
 from .probe import ProbeError, check_bomb, classify_extract, probe, probe_with_password
 from .sevenzip import SevenZip, SevenZipCancelled
 from .store import TaskStore
@@ -716,7 +717,9 @@ class Pipeline:
     def _attempt_extract(
         self, archive: Path, out_dir: Path, candidates: list[str], task_id: int
     ) -> AttemptOutcome:
-        """空密码先试，再按候选顺序尝试；密码错误换下一个，其他失败保留现场。
+        """空密码先试，再按候选顺序尝试；ZIP 先快速排除明显错误的候选。
+
+        预筛通过仍需完整解压确认。密码错误换下一个，其他失败保留现场。
 
         候选全部失败后，若注册了 ask_password 回调（UI 弹窗等），现场询问密码
         并立即重试，最多 3 次；用户放弃则进入 needs_password。
@@ -728,7 +731,26 @@ class Pipeline:
                 seen.add(cand)
                 attempts.append(cand)
         last_msg = ""
-        for pwd in attempts:
+        password_filter = None
+        last_percent = -1
+        total = len(attempts) - 1
+        for index, pwd in enumerate(attempts):
+            if self._cancel_requested():
+                return AttemptOutcome(message="用户取消", password_issue=False)
+            if pwd:
+                percent = (index - 1) * 100 // total
+                if percent != last_percent:
+                    last_percent = percent
+                    self._emit({
+                        "kind": "phase", "task_id": task_id, "percent": percent,
+                        "message": f"正在查找密码（{index}/{total}）",
+                    })
+                if password_filter is not None and not password_filter.may_match(pwd):
+                    last_msg = "密码均不匹配"
+                    continue
+            if pwd:
+                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                            "message": "正在解压"})
             result = self._run_extract(task_id, archive, out_dir, pwd)
             if result is None:
                 return AttemptOutcome(message="用户取消", password_issue=False)
@@ -740,6 +762,8 @@ class Pipeline:
             if not wrong_pw:
                 return AttemptOutcome(message=last_msg, password_issue=False)
             shutil.rmtree(out_dir, ignore_errors=True)
+            if not pwd:
+                password_filter = make_zip_password_filter(archive)
 
         if self._ask_password is not None:
             for _ in range(3):
@@ -756,6 +780,8 @@ class Pipeline:
                 if manual in seen:
                     continue
                 seen.add(manual)
+                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                            "message": "正在解压"})
                 result = self._run_extract(task_id, archive, out_dir, manual)
                 if result is None:
                     return AttemptOutcome(message="用户取消", password_issue=False)

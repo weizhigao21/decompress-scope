@@ -60,6 +60,28 @@ def test_samedir_lands_next_to_archive(tmp_path):
     assert report.output_dirs and Path(report.output_dirs[0]) == inputs / "pack"
 
 
+@pytest.mark.parametrize("mode", [OUTPUT_SAMEDIR, OUTPUT_WORKDIR])
+def test_split_archive_output_has_no_archive_or_volume_suffix(tmp_path, mode):
+    """真实分卷解压与交付的目录只保留主名，源分卷保持不变。"""
+    exe, inputs, cfg, pipe = _make_env(tmp_path, mode)
+    payload = os.urandom(3500)
+    source = inputs / "data.bin"
+    source.write_bytes(payload)
+    _run7z(exe, ["a", "-v1k", "My.Series.7z", "data.bin"], inputs)
+    source.unlink()
+    parts = sorted(inputs.glob("My.Series.7z.*"))
+    assert len(parts) > 1
+
+    report = pipe.run([parts[0]])
+
+    assert report.done == 1 and report.failed == 0
+    delivered = inputs / "My.Series"
+    assert report.output_dirs == [str(delivered)]
+    assert (delivered / "data.bin").read_bytes() == payload
+    assert not (inputs / "My.Series.7z").exists()
+    assert all(part.is_file() for part in parts)
+
+
 def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
     """同名包解两次：第二次避让为 "pack (2)"，第一份产物不被覆盖。
 

@@ -65,7 +65,7 @@ def derived_from_source(source: str) -> list[str]:
 
 
 def build_candidates(archive_name: str, source: str, vault_candidates: list[str]) -> list[str]:
-    """按优先级合并所有密码候选，大小写去重。
+    """按优先级合并所有密码候选，按原文去重、保留大小写差异。
 
     顺序即优先级，且**必须在调用方截断之前**就排好：
         文件名/提示 → 来源域名派生 → 密码库命中 → 内置字典

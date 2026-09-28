@@ -169,6 +169,34 @@ def test_archive_without_suffix_uses_stem(tmp_path):
     assert plan.out_dir.name == "noext"
 
 
+def test_output_names_remove_archive_suffixes_but_keep_title_dots(tmp_path):
+    """完整去掉复合后缀、分卷标记和视频伪装后缀，保留主名大小写与点。"""
+    cfg = _cfg(tmp_path)
+    cases = {
+        "pack.tar.gz": "pack",
+        "pack.tar.bz2": "pack",
+        "pack.tar.xz": "pack",
+        "Pack.7z.001": "Pack",
+        "Pack.zip.0001": "Pack",
+        "Pack.PART01.RAR": "Pack",
+        "Pack.part1.zip": "Pack",
+        "Pack.zip.zip": "Pack",
+        "Movie.MP4.zip": "Movie",
+        "Pack.zip.改名": "Pack",
+        "Series.v1.7Z.001": "Series.v1",
+        "Series.v1.part01.rar.mp4": "Series.v1",
+        "example.com.zip": "example.com",
+        "Series.2026.09.29.rar": "Series.2026.09.29",
+        "Series.v1.奇怪后缀": "Series.v1",
+        "noext": "noext",
+    }
+    for name, expected in cases.items():
+        for mode in (OUTPUT_SAMEDIR, OUTPUT_WORKDIR):
+            plan = plan_output(_task(tmp_path, name), cfg, mode)
+            assert plan.out_dir.name == expected, name
+            assert plan.final_dir.name == expected, name
+
+
 def test_archive_stem_used_as_dirname_is_sanitized(tmp_path):
     """包名当目录名前必须消毒：`...zip` 的 stem 正好是 ".."。
 

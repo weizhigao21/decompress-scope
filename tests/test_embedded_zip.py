@@ -123,7 +123,10 @@ def test_selected_second_carrier_finds_first_and_joins_inner_volumes(tmp_path):
     try:
         report = pipe.run([second])
         assert report.failed == 0 and report.done == 3
-        assert list((tmp_path / "work").rglob("data.bin"))
+        extracted = list((tmp_path / "work").rglob("data.bin"))
+        assert len(extracted) == 1
+        assert extracted[0].parent.name == "inner"
+        assert extracted[0].read_bytes() == (stage / "data.bin").read_bytes()
         assert not list((tmp_path / "work").rglob("inner.7z.*"))
         assert first.exists() and second.exists()
     finally:

@@ -20,6 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR, sanitize_component
+from .archive_detect import VIDEO_EXTS, volume_info
+from .config import DEFAULT_ARCHIVE_EXTS
+
+
+_OUTPUT_SUFFIXES = frozenset(DEFAULT_ARCHIVE_EXTS) | VIDEO_EXTS
 
 
 @dataclass
@@ -44,11 +49,28 @@ def archive_dir_name(archive) -> str:
     内层包与最外层包都用它命名产物目录，所以必须是同一个函数——两处各写一份
     迟早会漂移出两种叫法。
 
+    去掉压缩格式、视频载体的后缀和分卷标记，例如 `pack.tar.gz`、
+    `pack.7z.001`、`pack.part01.rar` 都命名为 `pack`；主名中的点保留。
+
     绝不能直接把 stem 当目录名：`...zip` 的 stem 正好是 `".."`，拼进源目录后
     路径 normalize 回来就是**源目录本身**，产物会被平铺进用户的下载目录。
     与盘符逃逸同族——都是把外部字符串直接当路径成分。
     """
-    return sanitize_component(Path(archive).stem)
+    path = Path(archive)
+    # 未知的伪装后缀沿用原来的规则，先去掉最后一段；分卷则留给下面整体处理。
+    name = path.name if volume_info(path) else path.stem
+    while True:
+        path = Path(name)
+        if volume_info(path):
+            if path.suffix[1:].isdigit():  # pack.7z.001 → pack.7z
+                name = path.stem
+            else:  # pack.part01.rar → pack
+                name = path.stem.rsplit(".", 1)[0]
+        elif path.suffix.lower() in _OUTPUT_SUFFIXES:
+            name = path.stem
+        else:
+            break
+    return sanitize_component(name)
 
 
 def unique_path(base: Path) -> Path:
