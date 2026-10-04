@@ -35,6 +35,7 @@ from core.formatting import human_count, human_size
 from core.store import TaskStore
 from core.workdir_cleanup import CLEANABLE, ORPHAN, prune, scan_workdir
 from ui import theme
+from ui.glass import GlassWindowMixin
 
 (_COL_CHECK, _COL_TASK, _COL_VERDICT, _COL_SIZE, _COL_REASON) = range(5)
 
@@ -46,8 +47,11 @@ _KIND_COLORS = {
 _EMPTY_HINT = "工作目录很干净，没有残留。"
 
 
-class WorkdirWindow(QMainWindow):
-    """工作目录残留盘点与清理。清理成功后 emit cleaned(释放字节数)。"""
+class WorkdirWindow(GlassWindowMixin, QMainWindow):
+    """工作目录残留盘点与清理。清理成功后 emit cleaned(释放字节数)。
+
+    继承 GlassWindowMixin 拿到无边框 + 毛玻璃（与主窗口一致的外观）。
+    """
 
     # 必须显式写 "qint64"，不能用裸 int：PySide6 把 `Signal(int)` 映射到 C++ 的
     # 32 位 int，而这里传的是**释放的字节数**——上限 2,147,483,647 只够 2 GiB，
@@ -68,6 +72,7 @@ class WorkdirWindow(QMainWindow):
         self._rows: list = []
         self._build_ui()
         self.refresh()
+        self.init_glass(self.centralWidget())
 
     # ---------- UI 构建 ----------
 
@@ -77,6 +82,9 @@ class WorkdirWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
+
+        # 标题栏（窗口名 + 关闭）：无边框窗口的唯一窗口控制入口
+        root.addWidget(self.build_title_bar("工作目录残留"))
 
         root.addWidget(self._build_toolbar())
 
@@ -276,6 +284,11 @@ class WorkdirWindow(QMainWindow):
             self.cleaned.emit(freed)
 
     # ---------- 生命周期 ----------
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 毛玻璃必须等 show 之后：winId 到这时才存在
+        self.enable_glass()
 
     def closeEvent(self, event) -> None:
         self.closed.emit()

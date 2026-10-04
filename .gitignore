@@ -25,3 +25,9 @@ config.json
 # ---- AI 协作目录（不入公开仓库）----
 .workbuddy/
 .claude/
+
+# ---- 开发过程截图（只保留 README 引用的最终版）----
+shots/_dev/
+
+# ---- 早期界面方案草案（已被当前实现取代，仅本机对照）----
+docs/ui-preview/

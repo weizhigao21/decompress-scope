@@ -1,9 +1,20 @@
-"""暗色主题：设计令牌与 QSS 样式表。
+"""暗色玻璃主题：设计令牌与 QSS 样式表。
 
-设计取向：自用、极简高效、暗色沉浸。
-- 表面层级：canvas → surface → raised，靠亮度而非边框拉开层次
+设计取向：自用、极简高效、暗色沉浸 + 原生毛玻璃。
+- 表面层级：canvas → surface → raised，靠**白色微透明叠加**而非深色压暗拉开层次
 - 唯一强调色 #3B9EFF，只用于主操作与进度
 - 状态色语义化，全部满足 WCAG AA 4.5:1
+
+⚠️ 玻璃化后三条不可动摇的规则（都是实测踩出来的）：
+1. **叠加一律用白色**（rgba(255,255,255,0.04~0.09)），不要用深色叠加。
+   深色叠加沉到半透明底板之下，读出来就是"黑洞"；白色叠加在任何壁纸上
+   都稳定"亮一档"。
+2. **描边不要用亮白色**。底板半透明后，白描边会被提亮成一条刺眼的白框
+   （本机实测 rgba(255,255,255,0.10) 明显可见）。改用暗色 rgba(0,0,0,0.28)
+   或把白色压到 0.05 以下。
+3. **顶层窗口的 QSS background 不会被绘制**。设了
+   WA_TranslucentBackground 的窗口必须把底板放到一个子控件上，
+   否则 grab() 出来是全透明（见 glass.py 的 _GlassDialogSurface）。
 """
 from __future__ import annotations
 
@@ -11,15 +22,42 @@ from pathlib import Path
 
 # ---------- 设计令牌 ----------
 
-CANVAS = "#0D1117"      # 窗口底
-SURFACE = "#161B22"     # 面板 / 列表
-RAISED = "#1F2630"      # 输入框 / 按钮
-LINE = "#2D3844"        # 分隔线 / hover 边
-LINE_SOFT = "#232B36"   # 极淡分隔
+# 玻璃底板。半透明而不是纯黑 —— 这是"看起来还是纯黑"的解药。
+GLASS_BASE = "#1B1D21"
+
+# 底板不透明度 —— **全流程只有一个值**。
+#
+# 项目已放弃 Windows 原生模糊（见 `ui/glass.py` 的 `USE_NATIVE_BLUR`），
+# 窗口的通透感**完全**由这一层半透明底板提供：静止、拖动、缩放、对话框降级，
+# 全都是同一个形态。这样就不存在"有模糊 ↔ 无模糊"的状态切换 —— 而那个切换
+# 本身就是观感不连贯的源头（用户原话："不太有连贯性"），还连带拖出一串问题
+# （拖动迟滞、背景闪烁、松手后恢复延迟）。
+#
+# 值取 0.72：桌面内容清楚可见，同时把文字对比度托住（再透就掉）。
+#
+# 历史：曾经有两个值 —— `0.86`（静止/降级）与 `0.72`（拖动期，因为那时要撤掉
+# 系统模糊、没有背景兜底）。放弃原生模糊后两者合并，少一个概念、也少一类
+# "两个状态不一致"的缺陷。
+GLASS_BASE_ALPHA = 0.72
+
+CANVAS = "rgba(27, 29, 33, 0.72)"   # 窗口底（与底板同透明度，避免两层叠加变深）
+
+SURFACE = "rgba(255, 255, 255, 0.04)"  # 面板 / 分组：白色微透明叠加
+# 列表 / 树是**大面积文字承载区**，与面板的诉求相反：那里需要更稳、更沉的底，
+# 否则半透明白会把一整屏文字的对比度拉低（渲染实测：0.04 叠在玻璃底上偏亮偏灰）。
+# 用极淡的暗色叠加压住，读起来仍是玻璃，但文字更清楚。
+SURFACE_LIST = "rgba(0, 0, 0, 0.14)"
+RAISED = "rgba(255, 255, 255, 0.075)"   # 输入框 / 按钮：再亮一档
+LINE = "rgba(255, 255, 255, 0.10)"        # 分隔线 / hover 边
+LINE_SOFT = "rgba(255, 255, 255, 0.06)"   # 极淡分隔
+
+# 描边一律用暗色：见文件头规则 2。白描边在半透明底板上会变成刺眼白框。
+STROKE = "rgba(0, 0, 0, 0.28)"
+STROKE_SOFT = "rgba(0, 0, 0, 0.18)"
 
 TEXT = "#E6EDF3"        # 主要
-TEXT_MUTED = "#8B949E"  # 次要
-TEXT_FAINT = "#5E6773"  # 弱化 / 占位
+TEXT_MUTED = "#9BA6B4"  # 次要（原 #8B949E 提亮：底板变浅后需补对比）
+TEXT_FAINT = "#6E7783"  # 弱化 / 占位（原 #5E6773 仅 2.96:1，未达 AA）
 
 ACCENT = "#3B9EFF"
 ACCENT_HOVER = "#57AEFF"
@@ -61,6 +99,28 @@ def status_color(state: str) -> str:
 FONT_FAMILY = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif'
 FONT_MONO = '"Cascadia Mono", "Consolas", "JetBrains Mono", monospace'
 
+# ---------- 圆角 ----------
+
+R_PANEL = 14   # 面板：玻璃材质在更圆的角上才读得出来
+R_LIST = 10    # 列表 / 树
+R_CARD = 10    # 卡片
+R_INPUT = 7    # 输入框 / 按钮
+R_CHECK = 4    # 复选框
+
+# 无边框窗口的自绘标题栏高度（glass.GlassDialogMixin 用）
+DIALOG_TITLEBAR_H = 34
+
+
+def bg_rgba(alpha: float) -> str:
+    """玻璃底板色（带透明度）。
+
+    从 GLASS_BASE 推导而不是各处写死 `rgba(27, 29, 33, …)` —— 同一颜色在 QSS
+    与窗口代码里各存一份，改色时必漏一处（`#1B1D21` 与 `27,29,33` 是同一个值，
+    肉眼根本看不出来）。
+    """
+    r, g, b = (int(GLASS_BASE[i:i + 2], 16) for i in (1, 3, 5))
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
 # ---------- 资源 ----------
 
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
@@ -98,10 +158,11 @@ QToolTip {{
 }}
 
 /* ===== 面板 ===== */
+/* 描边用 STROKE（暗色）而非 LINE：底板半透明后，白描边会被提亮成刺眼白框。 */
 QGroupBox {{
     background-color: {SURFACE};
-    border: 1px solid {LINE};
-    border-radius: 10px;
+    border: 1px solid {STROKE};
+    border-radius: {R_PANEL}px;
     margin-top: 14px;
     padding: 14px 12px 12px 12px;
     font-weight: 500;
@@ -112,14 +173,16 @@ QGroupBox::title {{
     left: 12px;
     padding: 0 6px;
     color: {TEXT_MUTED};
-    background-color: {CANVAS};
+    /* 原来用 CANVAS 做"抠洞"来盖住分组线。CANVAS 现在是半透明的，
+       盖不住 —— 改用与面板同色的实底，否则标题处会透出下层内容。 */
+    background-color: {GLASS_BASE};
 }}
 
 /* 无边框分组（靠内边距分区的面板） */
 QFrame[panel="true"] {{
     background-color: {SURFACE};
-    border: 1px solid {LINE};
-    border-radius: 10px;
+    border: 1px solid {STROKE};
+    border-radius: {R_PANEL}px;
 }}
 
 /* ===== 折叠标题栏 ===== */
@@ -137,20 +200,22 @@ QToolButton[section="true"]:hover {{ color: {ACCENT}; }}
 QPushButton {{
     background-color: {RAISED};
     color: {TEXT};
-    border: 1px solid {LINE};
-    border-radius: 7px;
+    border: 1px solid {STROKE};
+    border-radius: {R_INPUT}px;
     padding: 7px 14px;
     min-height: 18px;
 }}
 QPushButton:hover {{
     background-color: {LINE};
-    border-color: {LINE};
+    border-color: {STROKE_SOFT};
 }}
-QPushButton:pressed {{ background-color: #38455A; }}
+/* 按下态原来是硬编码 #38455A（一个不透明的灰块）。玻璃底上它会突兀地
+   "凸"出来，改成比 hover 更亮一档的白色叠加，与整套层级语言一致。 */
+QPushButton:pressed {{ background-color: rgba(255, 255, 255, 0.12); }}
 QPushButton:disabled {{
     background-color: {SURFACE};
     color: {TEXT_FAINT};
-    border-color: {LINE_SOFT};
+    border-color: {STROKE_SOFT};
 }}
 
 /* 主操作：唯一使用强调色的按钮 */
@@ -181,11 +246,13 @@ QPushButton[ghost="true"]:hover {{
 }}
 
 /* ===== 输入控件 ===== */
+/* 输入控件必须保持不透明底：文字压在半透明层上会掉对比度。
+   玻璃感靠描边与圆角给出，不靠底色透明。 */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {RAISED};
     color: {TEXT};
-    border: 1px solid {LINE};
-    border-radius: 7px;
+    border: 1px solid {STROKE};
+    border-radius: {R_INPUT}px;
     padding: 6px 9px;
     selection-background-color: {ACCENT};
     selection-color: {ACCENT_TEXT};
@@ -203,7 +270,7 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
     width: 16px;
 }}
 QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-    background-color: #38455A;
+    background-color: rgba(255, 255, 255, 0.12);
 }}
 /* 箭头必须显式给图：一旦给 ::up-button/::down-button 设了背景，Qt 就不再画
    默认箭头，只留一块纯色 —— 表现就是「有灰条没三角」。 */
@@ -233,8 +300,8 @@ QCheckBox {{ spacing: 7px; color: {TEXT_MUTED}; }}
 QCheckBox::indicator {{
     width: 15px;
     height: 15px;
-    border: 1px solid {LINE};
-    border-radius: 4px;
+    border: 1px solid {STROKE};
+    border-radius: {R_CHECK}px;
     background-color: {RAISED};
 }}
 QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
@@ -269,8 +336,8 @@ QTreeView::indicator, QTreeWidget::indicator,
 QTableView::indicator, QListView::indicator {{
     width: 15px;
     height: 15px;
-    border: 1px solid {LINE};
-    border-radius: 4px;
+    border: 1px solid {STROKE};
+    border-radius: {R_CHECK}px;
     background-color: {RAISED};
 }}
 QTreeView::indicator:hover, QTreeWidget::indicator:hover,
@@ -291,19 +358,19 @@ QTableView::indicator:checked:disabled, QListView::indicator:checked:disabled {{
 }}
 
 /* ===== 设置窗口：左侧模块导航 ===== */
-/* 导航用「亮度台阶」表达选中：底板 SURFACE(#161B22)、选中项 RAISED(#1F2630)。
-   刻意不动用 ACCENT —— 强调色只留给主操作（保存）与进度。 */
+/* 导航用「白色叠加的层级台阶」表达选中：底板 SURFACE(白 0.04)、
+   选中项 RAISED(白 0.075)。刻意不动用 ACCENT —— 强调色只留给主操作与进度。 */
 QListWidget#settingsNav {{
-    background-color: {SURFACE};
+    background-color: {SURFACE_LIST};
     border: none;
-    border-right: 1px solid {LINE};
+    border-right: 1px solid {STROKE};
     border-radius: 0;
     padding: 12px 10px;
     outline: none;
 }}
 QListWidget#settingsNav::item {{
     padding: 9px 12px;
-    border-radius: 7px;
+    border-radius: {R_INPUT}px;
     color: {TEXT_MUTED};
 }}
 QListWidget#settingsNav::item:hover {{
@@ -344,29 +411,36 @@ QLabel[role="residue"][warn="true"] {{ background: transparent; color: {WARN}; }
 
 /* ===== 列表 / 树 ===== */
 QListWidget, QTreeWidget, QTreeView {{
-    background-color: {SURFACE};
-    alternate-background-color: {SURFACE};
-    border: 1px solid {LINE};
-    border-radius: 8px;
+    background-color: {SURFACE_LIST};
+    alternate-background-color: {SURFACE_LIST};
+    border: 1px solid {STROKE};
+    border-radius: {R_LIST}px;
     outline: none;
     padding: 4px;
 }}
+/* ⚠️ 这里**不能**写 `color`：QSS 规则的优先级高于 `QTreeWidgetItem.setForeground()`，
+   一旦设了 color，状态列（pending/extracting/done/failed 语义色）与加密包类型列
+   的前景色会被整片压成 TEXT 色 —— item 的 foreground 数据还在，渲染却全是白的。
+   玻璃化后重渲时实测踩到：`item.foreground()` 返回 #3b9eff，grab() 里却一个
+   偏蓝像素都没有。文字颜色一律交给 item 自身（默认继承 palette 的 Text 色）。 */
 QListWidget::item, QTreeWidget::item {{
     padding: 5px 6px;
     border-radius: 5px;
-    color: {TEXT};
 }}
 QListWidget::item:hover, QTreeWidget::item:hover {{ background-color: {RAISED}; }}
+/* 选中态同理只给底色不给 color：否则选中行的状态色又会被压平。 */
 QListWidget::item:selected, QTreeWidget::item:selected {{
     background-color: {LINE};
-    color: {TEXT};
 }}
 
+/* 表头底色原与列表同色（SURFACE）。玻璃化后两者都是半透明白，会融成一片，
+   看不出边界 —— 但压深不能过头：这里只做轻微下沉，用与描边同族的暗色叠加，
+   而非接近不透明的黑（那会让整块表头在玻璃上读成一个"黑洞"）。 */
 QHeaderView::section {{
-    background-color: {SURFACE};
+    background-color: rgba(0, 0, 0, 0.20);
     color: {TEXT_MUTED};
     border: none;
-    border-bottom: 1px solid {LINE};
+    border-bottom: 1px solid {STROKE};
     padding: 7px 8px;
     font-weight: 400;
 }}
@@ -397,7 +471,7 @@ QScrollBar::handle:vertical {{
     border-radius: 5px;
     min-height: 28px;
 }}
-QScrollBar::handle:vertical:hover {{ background: #38455A; }}
+QScrollBar::handle:vertical:hover {{ background: rgba(255, 255, 255, 0.28); }}
 QScrollBar:horizontal {{
     background: transparent;
     height: 10px;
@@ -408,21 +482,27 @@ QScrollBar::handle:horizontal {{
     border-radius: 5px;
     min-width: 28px;
 }}
-QScrollBar::handle:horizontal:hover {{ background: #38455A; }}
+QScrollBar::handle:horizontal:hover {{ background: rgba(255, 255, 255, 0.28); }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
 /* ===== 状态栏 ===== */
+/* 同表头的理由：状态栏横贯窗口底部，太深会在玻璃上压成一条黑带。
+   轻微下沉即可，靠顶部那条描边提供边界。
+
+   ⚠️ 这里的内边距**不能**写在 QSS 的 padding 里 —— 实测 QStatusBar 不吃
+   QSS padding（改了渲染毫无变化）。改用代码侧的 setContentsMargins，
+   见 MainWindow._build_ui。 */
 QStatusBar {{
-    background-color: {SURFACE};
+    background-color: rgba(0, 0, 0, 0.18);
     color: {TEXT_MUTED};
-    border-top: 1px solid {LINE};
+    border-top: 1px solid {STROKE};
 }}
 QStatusBar::item {{ border: none; }}
 
 /* ===== 分裂器 ===== */
-QSplitter::handle {{ background-color: {LINE_SOFT}; }}
-QSplitter::handle:hover {{ background-color: {LINE}; }}
+QSplitter::handle {{ background-color: {STROKE_SOFT}; }}
+QSplitter::handle:hover {{ background-color: {STROKE}; }}
 
 /* ===== 标签辅助 ===== */
 QLabel[hint="true"] {{ color: {TEXT_MUTED}; }}
@@ -442,4 +522,88 @@ QLabel[stat="label"] {{ background: transparent; color: {TEXT_FAINT}; font-size:
    字号**必须**在 QSS 里给——`QWidget {{ font-size: 13px; }}` 优先级高于
    `setFont()`，代码里 setPointSize 会被整个覆盖，版本号会跟产品名一样大。 */
 QLabel[role="version"] {{ background: transparent; color: {TEXT_FAINT}; font-size: 11px; }}
+
+/* ===== 无边框窗口的窗口控制按钮 =====
+   自绘图标按钮（ui/icons.py）。close 单独一条：悬停即用错误色，
+   这是 Windows 惯例 —— 用户在关窗口前就该得到"这一步不可逆"的提示，
+   而其他按钮的悬停统一用强调色。 */
+QPushButton#winCtl {{
+    background: transparent;
+    border: none;
+    border-radius: {R_INPUT}px;
+}}
+QPushButton#winCtl:hover {{ background-color: rgba(255, 255, 255, 0.10); }}
+QPushButton#winCtl:pressed {{ background-color: rgba(255, 255, 255, 0.16); }}
+QPushButton#winCtl[danger="true"]:hover {{
+    background-color: rgba(248, 81, 73, 0.22);
+}}
+QPushButton#winCtl[danger="true"]:pressed {{
+    background-color: rgba(248, 81, 73, 0.34);
+}}
 """
+
+
+# ---------- 毛玻璃窗口 ----------
+
+def dialog_qss(mode: str = "opaque", bg: str | None = None) -> str:
+    """无边框玻璃窗口的样式表。
+
+    `mode` 只有两个合法值，且**必须二选一**：
+    - "glass"  → 原生 Acrylic 已在窗口后方生效，底板必须透明，否则会盖住它；
+    - "opaque" → 自行绘制底板（降级态 / 拖动期原生模糊被撤下时）。
+
+    两者同时不成立会出现「系统不画 + Qt 也没画」的透明帧，窗口直接露出桌面。
+    把状态收进一个字符串参数而不是若干布尔量，就是为了让非法组合无法表达。
+
+    `bg` 是拖动期用的底板色（来自定格快照的边缘采样）；它是快照之下的兜底，
+    拿不到就用主题玻璃底。
+    """
+    if mode == "glass":
+        plate = "background: transparent;"
+    else:
+        plate = f"background: {bg or bg_rgba(GLASS_BASE_ALPHA)};"
+    return f"""
+QWidget#glassDialog {{
+    {plate}
+}}
+QWidget#glassDialogSurface {{
+    {plate}
+    border: 1px solid {STROKE};
+    border-radius: {R_PANEL}px;
+}}
+QWidget#glassTitleBar {{
+    background: transparent;
+}}
+QLabel#glassTitleLabel {{
+    background: transparent;
+    color: {TEXT};
+    font-size: {DIALOG_TITLEBAR_H - 18}px;
+    font-weight: 500;
+}}
+"""
+
+
+def glass_surface_qss(alpha: float | None = None, bg: str | None = None) -> str:
+    """主面板玻璃底板样式。三种形态，靠参数组合区分：
+
+    - `glass_surface_qss()`（全空）→ **透明**：原生模糊已生效，把 Acrylic 让出来。
+    - `glass_surface_qss(bg="#232427")` → **实色**：拖动期用。`bg` 一般来自定格
+      快照的边缘实测色（随壁纸而变），比写死主题色更贴近静止观感。
+    - `glass_surface_qss(0.86)` → **半透明底**：原生模糊不可用时的降级自绘。
+
+    `bg` 同时是快照之下的兜底：万一快照没画上，窗口也不能变成一块透明
+    （那正是"移动时毛玻璃直接没了、只剩颜色"的成因）。
+
+    幂等由调用方保证（`setStyleSheet` 会触发重绘，拖动路径不该反复调）。
+    """
+    if alpha is None and bg is None:
+        return (
+            f"QWidget#glassSurface {{ background: transparent;"
+            f" border: none; border-radius: {R_PANEL}px; }}"
+        )
+    return (
+        f"QWidget#glassSurface {{"
+        f" background: {bg or bg_rgba(alpha)};"
+        f" border: 1px solid {STROKE};"
+        f" border-radius: {R_PANEL}px; }}"
+    )

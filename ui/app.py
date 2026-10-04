@@ -11,23 +11,28 @@ def _application_icon_path() -> Path:
 
 
 def _apply_dark_palette(app) -> None:
-    """原生控件（弹窗、菜单、输入框内部）也跟随暗色，避免白底刺眼。"""
+    """原生控件（弹窗、菜单、输入框内部）也跟随暗色，避免白底刺眼。
+
+    玻璃化后这些"非客户区/原生绘制"的部分**仍是实色**：它们由系统绘制，
+    QSS 的半透明管不到（参见 theme 模块头的规则 3）。Base 用玻璃底色的实色版，
+    保证与半透明底板视觉连续。
+    """
     from PySide6.QtGui import QColor, QPalette
 
     from ui import theme
 
     pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(theme.CANVAS))
+    pal.setColor(QPalette.Window, QColor(theme.GLASS_BASE))
     pal.setColor(QPalette.WindowText, QColor(theme.TEXT))
-    pal.setColor(QPalette.Base, QColor(theme.SURFACE))
-    pal.setColor(QPalette.AlternateBase, QColor(theme.RAISED))
+    pal.setColor(QPalette.Base, QColor(theme.GLASS_BASE))
+    pal.setColor(QPalette.AlternateBase, QColor(theme.GLASS_BASE))
     pal.setColor(QPalette.Text, QColor(theme.TEXT))
     pal.setColor(QPalette.PlaceholderText, QColor(theme.TEXT_FAINT))
-    pal.setColor(QPalette.Button, QColor(theme.RAISED))
+    pal.setColor(QPalette.Button, QColor(theme.GLASS_BASE))
     pal.setColor(QPalette.ButtonText, QColor(theme.TEXT))
     pal.setColor(QPalette.Highlight, QColor(theme.ACCENT))
     pal.setColor(QPalette.HighlightedText, QColor(theme.ACCENT_TEXT))
-    pal.setColor(QPalette.ToolTipBase, QColor(theme.RAISED))
+    pal.setColor(QPalette.ToolTipBase, QColor(theme.GLASS_BASE))
     pal.setColor(QPalette.ToolTipText, QColor(theme.TEXT))
     pal.setColor(QPalette.Link, QColor(theme.ACCENT))
     app.setPalette(pal)

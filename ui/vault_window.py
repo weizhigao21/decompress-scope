@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from core.vault import PasswordVault, VaultEntry
 from ui import theme
+from ui.glass import GlassWindowMixin
 
 # 表格列索引
 _COL_PASSWORD = 0
@@ -68,8 +69,11 @@ def _short_ts(ts: str | None, *, empty: str = "从未") -> str:
     return ts[:16].replace("T", " ")
 
 
-class VaultWindow(QMainWindow):
-    """密码库管理窗口。任何写操作成功后 emit vault_changed。"""
+class VaultWindow(GlassWindowMixin, QMainWindow):
+    """密码库管理窗口。任何写操作成功后 emit vault_changed。
+
+    继承 GlassWindowMixin 拿到无边框 + 毛玻璃（与主窗口一致的外观）。
+    """
 
     vault_changed = Signal()
     # close() 不会触发 QObject.destroyed（后者只在析构/deleteLater 时发出），
@@ -97,6 +101,7 @@ class VaultWindow(QMainWindow):
 
         self._build_ui()
         self.refresh()
+        self.init_glass(self.centralWidget())
 
     # ---------- UI 构建 ----------
 
@@ -107,6 +112,8 @@ class VaultWindow(QMainWindow):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
+        # 标题栏（窗口名 + 关闭）：无边框窗口的唯一窗口控制入口
+        root.addWidget(self.build_title_bar("密码库"))
         root.addWidget(self._build_toolbar())
 
         # 表格与空态共用一个容器，靠可见性切换
@@ -471,6 +478,11 @@ class VaultWindow(QMainWindow):
         self.refresh()
 
     # ---------- 生命周期 ----------
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 毛玻璃必须等 show 之后：winId 到这时才存在
+        self.enable_glass()
 
     def closeEvent(self, event) -> None:
         try:

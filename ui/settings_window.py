@@ -67,6 +67,7 @@ from core.shell_menu import (
     uninstall_context_menu,
 )
 from ui import theme
+from ui.glass import GlassWindowMixin
 from ui.workdir_window import WorkdirWindow
 
 _AUTORUN_LABELS = {
@@ -95,8 +96,11 @@ _LABEL_W = 88
 _MS_PER_CANDIDATE = 20
 
 
-class SettingsWindow(QMainWindow):
-    """偏好设置窗口。保存成功后 emit saved(cfg)。"""
+class SettingsWindow(GlassWindowMixin, QMainWindow):
+    """偏好设置窗口。保存成功后 emit saved(cfg)。
+
+    继承 GlassWindowMixin 拿到无边框 + 毛玻璃（与主窗口一致的外观）。
+    """
 
     saved = Signal(object)     # AppConfig
     closed = Signal()
@@ -117,15 +121,25 @@ class SettingsWindow(QMainWindow):
         self._workdir_window_dir: Path | None = None
         self._build_ui()
         self._load_from_cfg(cfg)
+        self.init_glass(self.centralWidget())
 
     # ---------- 骨架 ----------
 
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        # 外层竖排：标题栏（上） + 主体（下）。标题栏横跨导航与内容区，
+        # 与主窗口"窗口名在左上、控制在右上"的惯例一致。
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self.build_title_bar("设置"))
+
+        holder = QWidget()
+        root = QHBoxLayout(holder)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        outer.addWidget(holder, 1)
 
         # 左：模块导航。分割线由 QSS 的 border-right 给，不再加独立分隔控件。
         self.nav = QListWidget()
@@ -768,6 +782,8 @@ class SettingsWindow(QMainWindow):
         """每次显示都重算残留：窗口开着的时候可能又解压过好几轮。"""
         self._refresh_residue()
         super().showEvent(event)
+        # 毛玻璃必须等 show 之后：winId 到这时才存在
+        self.enable_glass()
 
     def closeEvent(self, event) -> None:
         # 残留窗口挂在本窗口下，主窗口关掉设置时它不能变成孤儿

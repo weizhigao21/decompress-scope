@@ -15,7 +15,8 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6 import QtCore
+from PySide6.QtCore import Qt, QPoint, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -54,6 +55,7 @@ from core.runtime_paths import runtime_data_root
 from core.formatting import human_count, human_size
 from core.vault import PasswordVault
 from ui import theme
+from ui.glass import GlassWindowMixin
 from ui.settings_window import SettingsWindow
 from ui.vault_window import VaultWindow
 from ui.worker import ExtractWorker
@@ -205,13 +207,20 @@ class StatCard(QFrame):
             f"color: {self._color if n else theme.TEXT_FAINT}; background: transparent;")
 
 
-class MainWindow(QMainWindow):
+class MainWindow(GlassWindowMixin, QMainWindow):
     DROP_HINT = "松开即可加入并开始解压"
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("解压开镜")
         self.resize(1000, 680)
+        # 毛玻璃三件套：无边框 + 半透明背景 + 底板交给子控件。
+        #
+        # 无边框是消掉"窗口上边那条白边"的**唯一**办法 —— 那条边来自系统原生
+        # 标题栏的非客户区，不是主题里的描边色，改 QSS 碰不到它。
+        # 代价：失去系统标题栏的拖动/缩放/最小化，所以下面自己实现。
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         # 窗口整体是拖放目标：拖到任务树/空白区也能加入。
         # QMainWindow 的 acceptDrops 本就是 true，但真正生效还要靠下面自己实现
         # 的 dragEnterEvent/dropEvent——QWidget 默认实现会 ignore 掉拖放。
@@ -291,9 +300,15 @@ class MainWindow(QMainWindow):
 
     # ---------- UI 构建 ----------
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 毛玻璃必须等 show 之后：winId 到这时才存在
+        self.enable_glass()
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
+
         root = QVBoxLayout(central)
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(10)
@@ -308,6 +323,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_vault_panel())
 
         self.statusBar().showMessage("就绪")
+        # 状态栏内边距由 init_glass 统一设置（无边框窗口的共性问题）
+
+        # 玻璃底板：铺满整个窗口并沉到最底。必须放在布局搭完之后。
+        self.init_glass(central)
 
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -364,6 +383,16 @@ class MainWindow(QMainWindow):
         self.settings_btn.setToolTip("输出位置、启动方式、解压参数")
         self.settings_btn.clicked.connect(self._open_settings_window)
         row.addWidget(self.settings_btn)
+
+        # 窗口控制按钮放在最后：无边框窗口没有系统标题栏，这三个按钮是用户
+        # 唯一能看见的关闭/最小化入口，缺一个窗口就没法关。放在设置之后，
+        # 让它贴着窗口右上角 —— 与所有桌面应用的惯例一致。
+        sep2 = QFrame()
+        sep2.setFixedWidth(1)
+        sep2.setFixedHeight(13)
+        sep2.setStyleSheet(f"background-color: {theme.LINE}; border: none;")
+        row.addWidget(sep2)
+        row.addWidget(self.build_window_buttons())
         return row
 
     def _on_autorun_toggled(self, on: bool) -> None:
