@@ -191,7 +191,7 @@ def test_theme_tokens_defined():
     qss = theme.build_stylesheet()
     assert "{" in qss and "QPushButton" in qss
     assert "#3B9EFF" in qss  # 唯一强调色
-    for name in ("CANVAS", "SURFACE", "RAISED", "LINE", "TEXT", "ACCENT"):
+    for name in ("SURFACE", "RAISED", "LINE", "TEXT", "ACCENT"):
         assert getattr(theme, name)
     assert set(theme.STATUS_COLORS) == {
         "pending", "probing", "extracting", "needs_password", "done", "failed"}

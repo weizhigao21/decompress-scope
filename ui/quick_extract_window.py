@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.appconfig import OUTPUT_SAMEDIR, AppConfig
+from core.appconfig import OPEN_NONE, OUTPUT_SAMEDIR, AppConfig
 from core.config import Config
 from core.runtime_paths import runtime_data_root
 from ui import theme
@@ -297,6 +297,7 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
             self.progress.setValue(100)
             self.status_label.setText(f"解压完成，已输出 {len(report.output_dirs)} 个结果目录")
             self.open_button.setEnabled(True)
+            self._maybe_open_results()
         elif report.skipped:
             self.status_label.setText("此前已解压，无需重复处理")
         else:
@@ -312,16 +313,40 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "解压开镜", message)
 
-    def _open_results(self) -> None:
+    def _open_results(self, limit: int | None = None) -> None:
+        """打开结果目录。`limit` 用于自动打开时的抑制（见 `_maybe_open_results`）。"""
         if self._report is None:
             return
-        for raw in self._report.output_dirs:
-            path = Path(raw)
-            if path.is_dir():
-                try:
-                    os.startfile(str(path))  # noqa: S606 Windows Explorer 入口
-                except OSError:
-                    continue
+        dirs = [Path(raw) for raw in (self._report.output_dirs or [])]
+        dirs = [d for d in dirs if d.is_dir()]
+        if limit is not None:
+            dirs = dirs[:limit]
+        for path in dirs:
+            try:
+                os.startfile(str(path))  # noqa: S606 Windows Explorer 入口
+            except OSError:
+                continue
+
+    def _maybe_open_results(self) -> None:
+        """按偏好决定是否**自动**打开结果目录。
+
+        偏好是 `open_after`，与主窗口共用同一个开关 —— 否则用户会发现
+        "主窗口里关掉了、右键进来还是照开"。右键进入的多是"解完就想看"的
+        场景，所以默认值是打开的；关掉时这里必须什么都不做。
+
+        「打开隔离工作目录」那一档是 workdir 时代的旧行为，右键窗口没有
+        workdir 视图，按"打开产物目录"处理 —— 那才是用户此刻想去的地方。
+        """
+        if self._report is None or not self._report.output_dirs:
+            return
+        try:
+            pref = AppConfig.ensure(CONFIG_PATH)
+        except Exception:
+            return                  # 偏好读不出来就按"不自动开"，别擅自弹窗
+        if pref.open_after == OPEN_NONE:
+            return
+        # 与主窗口同一策略：一次解出十几个目录时全开会淹没桌面，超过 5 个只开第一个。
+        self._open_results(limit=1 if len(self._report.output_dirs) > 5 else None)
 
     def _request_cancel(self) -> None:
         if self._thread is None or not self._thread.isRunning():

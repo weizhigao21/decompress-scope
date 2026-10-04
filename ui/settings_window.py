@@ -27,6 +27,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -52,6 +53,8 @@ from core.appconfig import (
     AUTORUN_CONFIRM,
     AUTORUN_DIRECT,
     AUTORUN_OFF,
+    OPEN_NONE,
+    OPEN_PATHS,
     OUTPUT_SAMEDIR,
     OUTPUT_WORKDIR,
     AppConfig,
@@ -161,6 +164,7 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self._add_page("启动与拖入", "什么情况下自动开始解压", self._page_start)
         self._add_page("解压阈值", "安全边界：超过任一上限即拒绝解压", self._page_limits)
         self._add_page("解压行为", "解压过程中的开关", self._page_behavior)
+        self._add_page("界面", "窗口底色深浅", self._page_appearance)
         self._add_page("密码", "密码从哪些线索里找、每个包最多试几个", self._page_password)
         self._add_page("记录与历史", "输入路径与任务记录的保留策略", self._page_history)
 
@@ -398,6 +402,44 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self.delete_orig_check.setProperty("danger", "true")
         form.addRow(self._field_label("原始包"), self.delete_orig_check)
 
+        self.open_after_check = QCheckBox("解压完成后自动打开结果目录")
+        self.open_after_check.setToolTip(
+            "完成后用资源管理器打开产物的所在目录（右键菜单的解压窗口同样遵守）。"
+            "取消勾选则什么都不打开 —— 原先设为「打开隔离工作目录」的，取消后也会一并关掉")
+        form.addRow(self._field_label("完成后"), self.open_after_check)
+
+    def _page_appearance(self, col: QVBoxLayout) -> None:
+        """外观页：目前只有一项，但它是唯一能调「整窗底色深浅」的地方。
+
+        为什么值得做成可调：整窗**只有一层底色**，同一个值同时决定"能透出多少
+        桌面"与"文字对比度" —— 桌面花不花、用户眼力如何，只有用户自己知道。
+        """
+        form = self._form(col)
+
+        self.opacity_spin = self._spin("window_opacity")
+        self.opacity_spin.setSuffix(" %")
+        self.opacity_spin.setSingleStep(2)
+        self.opacity_spin.setToolTip(
+            "窗口底板的不透明度。整窗只有这一层底色：调低更透（桌面内容更清楚），"
+            "调高更沉（文字更稳）")
+        self.opacity_hint = self._hint()
+        self.opacity_spin.valueChanged.connect(self._refresh_opacity_hint)
+        form.addRow(self._field_label("窗口不透明度"),
+                    self._stack(self.opacity_spin, self.opacity_hint))
+
+    def _refresh_opacity_hint(self) -> None:
+        """按当前值给一句"看起来会怎样"的说明 —— 光看百分比没有体感。"""
+        pct = self.opacity_spin.value()
+        if pct >= 95:
+            tone = "几乎不透明，看不到桌面内容"
+        elif pct >= 80:
+            tone = "偏沉，文字最稳"
+        elif pct >= 62:
+            tone = "默认档，桌面内容隐约可见"
+        else:
+            tone = "很透，桌面内容清楚，文字对比度会下降"
+        self.opacity_hint.setText(f"当前 {pct}%：{tone}。保存后立即生效，无需重启。")
+
     def _page_history(self, col: QVBoxLayout) -> None:
         form = self._form(col)
 
@@ -563,6 +605,8 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self.sniff_check.setChecked(cfg.sniff_archives)
         self.keep_mid_check.setChecked(cfg.delete_intermediate is False)
         self.delete_orig_check.setChecked(cfg.keep_original is False)
+        self.open_after_check.setChecked(cfg.open_after != OPEN_NONE)
+        self.opacity_spin.setValue(cfg.window_opacity)
         self.keep_days_spin.setValue(cfg.session_days)
 
         self._sync_output_dependents()
@@ -594,6 +638,11 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
             sniff_archives=self.sniff_check.isChecked(),
             delete_intermediate=not self.keep_mid_check.isChecked(),
             keep_original=not self.delete_orig_check.isChecked(),
+            # 三态收进一个复选框：勾 = 打开结果目录（推荐默认），不勾 = 什么都不开。
+            # 「打开隔离工作目录」那一档是 workdir 时代的旧行为，不再在 UI 上暴露，
+            # 但 core 仍认它（老配置文件不会因此失效）。
+            open_after=OPEN_PATHS if self.open_after_check.isChecked() else OPEN_NONE,
+            window_opacity=self.opacity_spin.value(),
             session_days=self.keep_days_spin.value(),
         ).normalize()
 
@@ -772,6 +821,13 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self._cfg = cfg
         # 回填规范化后的值，让用户立刻看到被纠正的结果（如深度被截到 10）
         self._load_from_cfg(cfg)
+        # 外观类偏好必须**立刻可见** —— 其余偏好都要等下次解压才起作用，只有
+        # 不透明度是"改了当场就该变"的。不刷新的话用户会以为没保存成功。
+        app = QApplication.instance()
+        if app is not None:
+            from ui import glass as _glass
+
+            _glass.apply_opacity(app, cfg.window_opacity)
         self.statusBar().showMessage("已保存", 4000)
         self.saved.emit(cfg)
         self.close()

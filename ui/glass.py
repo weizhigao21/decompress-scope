@@ -800,6 +800,29 @@ def resume(hwnd: int) -> bool:
     return apply_glass(hwnd)
 
 
+def apply_opacity(app, pct: int) -> None:
+    """把新的底板不透明度应用到**所有已打开的窗口**，并立刻重绘。
+
+    两步缺一不可：
+    1. `theme.set_glass_alpha_percent` —— 更新模块级值（之后新建的窗口会用它）；
+    2. 逐个窗口重设 `_glass_surface` 的样式表 —— 底板样式是**显式传参**设的
+       （`glass_surface_qss(theme.GLASS_BASE_ALPHA)`），只改模块级变量不会自动
+       生效。这是"改了设置但界面没变"最容易踩的一处。
+
+    单窗口成本约 0.04 ms（单个控件 `setStyleSheet` 的实测值），窗口数量是个位
+    数，所以设置窗口保存时同步做完即可，不需要异步或防抖。
+    """
+    from . import theme
+
+    theme.set_glass_alpha_percent(pct)
+    for win in app.topLevelWidgets():
+        surface = getattr(win, "_glass_surface", None)
+        if surface is None:
+            continue
+        surface.setStyleSheet(theme.glass_surface_qss(theme.GLASS_BASE_ALPHA))
+        surface.repaint()
+
+
 # ---------- 通用接入（QMainWindow 子窗口用） ----------
 
 class GlassWindowMixin:

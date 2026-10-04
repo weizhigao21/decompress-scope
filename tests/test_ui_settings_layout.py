@@ -40,7 +40,7 @@ from ui import theme  # noqa: E402
 from ui.settings_window import SettingsWindow  # noqa: E402
 
 # 模块清单：改这里就等于改导航栏。顺序即显示顺序。
-MODULES = ["输出位置", "启动与拖入", "解压阈值", "解压行为", "密码", "记录与历史"]
+MODULES = ["输出位置", "启动与拖入", "解压阈值", "解压行为", "界面", "密码", "记录与历史"]
 
 # 输入类控件：这些必须全部住在导航页里，漏在页外的就是没归位的设置项。
 INPUT_TYPES = (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox)

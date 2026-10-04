@@ -38,6 +38,27 @@ def _apply_dark_palette(app) -> None:
     app.setPalette(pal)
 
 
+def _load_window_opacity() -> None:
+    """启动时把偏好里的窗口不透明度注入主题。
+
+    必须在 `build_stylesheet()` 与任何窗口创建**之前**执行 —— 否则第一帧用的是
+    默认 0.72，随后再跳变一次，用户会看到闪一下。
+
+    读不出偏好不该拦住启动（首次运行、配置文件损坏都可能读到空），所以整体兜住。
+    """
+    from core.appconfig import AppConfig
+    from core.runtime_paths import runtime_data_root
+
+    from ui import theme
+
+    root = runtime_data_root(Path(__file__).resolve().parent.parent)
+    try:
+        cfg = AppConfig.ensure(root / "config.json")
+    except Exception:
+        return
+    theme.set_glass_alpha_percent(cfg.window_opacity)
+
+
 def _create_application():
     try:
         from PySide6.QtGui import QIcon
@@ -53,6 +74,7 @@ def _create_application():
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyle("Fusion")  # 保证 QSS 在 Windows 上完全生效
+    _load_window_opacity()
     _apply_dark_palette(app)
     app.setStyleSheet(theme.build_stylesheet())
 

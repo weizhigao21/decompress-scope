@@ -54,6 +54,9 @@ _CLAMP = {
     "recent_inputs_limit": (0, 200),
     "session_days": (1, 365),
     "extract_timeout": (30, 86400),
+    # 窗口底板不透明度（百分比）。下限 30 是"再透就看不清文字了"的经验值，
+    # 上限 100 = 完全不透明（等价于放弃半透明）。
+    "window_opacity": (30, 100),
 }
 
 
@@ -163,6 +166,12 @@ class AppConfig:
     recent_inputs_limit: int = 30
     recent_inputs: list[str] = None      # type: ignore[assignment]
     restore_last_inputs: bool = False    # 启动时把上次的输入放回输入区（默认关，避免误触）
+
+    # --- 界面 ---
+    # 窗口底板的不透明度（百分比，30~100）。整窗**只有这一层底色**，所以它同时
+    # 决定"能透出多少桌面"与"文字对比度"——取多少取决于用户的桌面花不花、眼力
+    # 如何，所以交给偏好，而不是写死在 theme 里。
+    window_opacity: int = 72
 
     # --- 其他 ---
     session_days: int = 30               # 任务记录保留天数（0 = 永久）
