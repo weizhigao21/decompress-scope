@@ -43,10 +43,12 @@ GLASS_BASE_ALPHA = 0.72
 CANVAS = "rgba(27, 29, 33, 0.72)"   # 窗口底（与底板同透明度，避免两层叠加变深）
 
 SURFACE = "rgba(255, 255, 255, 0.04)"  # 面板 / 分组：白色微透明叠加
-# 列表 / 树是**大面积文字承载区**，与面板的诉求相反：那里需要更稳、更沉的底，
-# 否则半透明白会把一整屏文字的对比度拉低（渲染实测：0.04 叠在玻璃底上偏亮偏灰）。
-# 用极淡的暗色叠加压住，读起来仍是玻璃，但文字更清楚。
-SURFACE_LIST = "rgba(0, 0, 0, 0.14)"
+# 列表 / 树：**不画底**。
+# 早先用 `rgba(0,0,0,0.14)` 压深，那是为"背景被系统模糊过、本身均匀"的场景设计
+# 的。放弃模糊后底板直接透出桌面，任何深色叠加都会在那一块形成暗斑，而列表是
+# 大面积区域，暗斑尤其显眼。区域边界交给 `border: 1px solid STROKE` 与行级
+# hover / 选中反馈表达，整窗只保留**一层**底板。
+SURFACE_LIST = "transparent"
 RAISED = "rgba(255, 255, 255, 0.075)"   # 输入框 / 按钮：再亮一档
 LINE = "rgba(255, 255, 255, 0.10)"        # 分隔线 / hover 边
 LINE_SOFT = "rgba(255, 255, 255, 0.06)"   # 极淡分隔
@@ -141,13 +143,32 @@ def build_stylesheet() -> str:
     """生成全局 QSS。"""
     return f"""
 /* ===== 基础 ===== */
+/* ⚠️ 这里**绝不能**给 `QWidget` 兜底设背景色。
+   Qt 的类型选择器匹配**所有子类**，于是窗口里每一层嵌套容器各画一层半透明
+   深色 —— 而窗口是半透明的，这些层会**真实叠加**：
+
+       1 层 → 桌面透过 28%      2 层 → 7.8%
+       3 层 → 2.2%              4 层以上 → 几乎全黑
+
+   主窗口里控件最深嵌套 6 层，于是界面上出现一块块深浅不一的矩形（用户的原话：
+   "黑色的斑块，一点都不平滑"）。有系统模糊时背景本身均匀，叠加看不出来；
+   放弃模糊后底板直接透出桌面，问题立刻暴露。
+
+   底色**只**由窗口底板的 `QWidget#glassSurface` 那一层提供，其余容器一律透明。
+   `color` / 字体这类不影响合成的属性照旧兜底。 */
 QWidget {{
-    background-color: {CANVAS};
+    /* 必须**显式**写 transparent，而不是省略这一行。
+       省略 = 控件回落到系统调色板 —— 那些没有单独写底色的部件（表头、
+       滚动区 viewport 等）会露出浅色系统底，实测 QHeaderView 直接变成一条
+       白带。写 transparent 才能既统一（不叠加）又可控（不露底）。 */
+    background-color: transparent;
     color: {TEXT};
     font-family: {FONT_FAMILY};
     font-size: 13px;
 }}
-QMainWindow, QDialog {{ background-color: {CANVAS}; }}
+/* 顶层窗口的 QSS background 本就不会被绘制（见文件头规则 3），
+   这里同样不设背景，避免留下"看起来有底、实际不画"的误导性规则。 */
+QMainWindow, QDialog {{ color: {TEXT}; }}
 
 QToolTip {{
     background-color: {RAISED};
@@ -433,11 +454,12 @@ QListWidget::item:selected, QTreeWidget::item:selected {{
     background-color: {LINE};
 }}
 
-/* 表头底色原与列表同色（SURFACE）。玻璃化后两者都是半透明白，会融成一片，
-   看不出边界 —— 但压深不能过头：这里只做轻微下沉，用与描边同族的暗色叠加，
-   而非接近不透明的黑（那会让整块表头在玻璃上读成一个"黑洞"）。 */
+/* 表头：**不画背景**，只留底部一条描边。
+   早先给过 `rgba(0,0,0,0.18~0.20)` 的深色下沉，那是为"背景被系统模糊过、
+   本身很均匀"的场景设计的；放弃模糊后底板直接透出桌面，任何深色叠加都会
+   把那一条压成明显的暗带。区域边界交给描边表达，不再靠明暗差。 */
 QHeaderView::section {{
-    background-color: rgba(0, 0, 0, 0.20);
+    background: transparent;
     color: {TEXT_MUTED};
     border: none;
     border-bottom: 1px solid {STROKE};
@@ -487,14 +509,14 @@ QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
 /* ===== 状态栏 ===== */
-/* 同表头的理由：状态栏横贯窗口底部，太深会在玻璃上压成一条黑带。
-   轻微下沉即可，靠顶部那条描边提供边界。
+/* 同表头：**不画背景**，只留顶部一条描边。横贯窗口底部的一条深色叠加在半透明
+   底板上会被读成"黑带"，边界交给描边即可。
 
    ⚠️ 这里的内边距**不能**写在 QSS 的 padding 里 —— 实测 QStatusBar 不吃
    QSS padding（改了渲染毫无变化）。改用代码侧的 setContentsMargins，
-   见 MainWindow._build_ui。 */
+   见 MainWindow._build_ui / GlassWindowMixin.init_glass。 */
 QStatusBar {{
-    background-color: rgba(0, 0, 0, 0.18);
+    background: transparent;
     color: {TEXT_MUTED};
     border-top: 1px solid {STROKE};
 }}

@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 from core.appconfig import OUTPUT_SAMEDIR, AppConfig
 from core.config import Config
 from core.runtime_paths import runtime_data_root
+from ui import theme
+from ui.glass import GlassWindowMixin
 from ui.worker import ExtractWorker
 
 PROJECT_ROOT = runtime_data_root(Path(__file__).resolve().parent.parent)
@@ -29,8 +31,12 @@ DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
 
-class QuickExtractWindow(QDialog):
-    """不显示选项的单路径解压窗口：打开即运行，例外才询问密码或报错。"""
+class QuickExtractWindow(GlassWindowMixin, QDialog):
+    """不显示选项的单路径解压窗口：打开即运行，例外才询问密码或报错。
+
+    同样是**无边框 + 半透明底板**：右键进入的窗口与主界面必须是一套外观，
+    否则用户会觉得从右键打开的是"另一个软件"。
+    """
 
     def __init__(self, paths: list[str], *, autostart: bool = True):
         super().__init__()
@@ -62,19 +68,32 @@ class QuickExtractWindow(QDialog):
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(10)
 
+        # 标题右侧挂窗口控制按钮：无边框窗口没有系统标题栏，不给关闭按钮
+        # 这个窗口就关不掉。尺寸固定的紧凑窗口只给关闭 —— 最小化只会让它
+        # 消失、反而找不回来（与设置/密码库/工作目录三个子窗口同一取舍）。
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
         title = QLabel("正在自动解压")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        layout.addWidget(title)
+        title.setStyleSheet(
+            f"font-size: 16px; font-weight: 600; background: transparent;"
+            f"color: {theme.TEXT};")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self.build_window_buttons(
+            minimize=False, maximize=False, box=24, icon=12))
+        layout.addLayout(head)
+
         self.path_label = QLabel("\n".join(Path(p).name for p in self._paths) or "未选择文件")
         self.path_label.setWordWrap(True)
-        self.path_label.setStyleSheet("color: #8B949E;")
+        self.path_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
         layout.addWidget(self.path_label)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
         layout.addWidget(self.progress)
         self.status_label = QLabel("准备中…")
-        self.status_label.setStyleSheet("color: #8B949E;")
+        self.status_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
         layout.addWidget(self.status_label)
 
         self.password_panel = QWidget(self)
@@ -109,6 +128,20 @@ class QuickExtractWindow(QDialog):
         self.cancel_button.clicked.connect(self._request_cancel)
         row.addWidget(self.cancel_button)
         layout.addLayout(row)
+
+        # 玻璃底板铺满整窗 —— 必须在所有子控件加完之后：它要 lower() 到最底，
+        # 而 resizeEvent 又依赖它已经存在。
+        #
+        # `edge_margin=0`：这是个尺寸固定的紧凑窗口（460×190，本身低于四边缩放
+        # 的最小尺寸），留缩放热区只会让边缘的拖拽被当成缩放、结果什么也缩不动。
+        self.init_glass(self, edge_margin=0)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 底板形态必须等 show 之后确认：`enable_glass` 拿 winId 才谈得上系统模糊
+        # （当前 `USE_NATIVE_BLUR=False`，它什么都不做；留着是为了开关一旦打开，
+        # 这个窗口不用再改）。
+        self.enable_glass()
 
     def _make_cfg(self) -> Config:
         pref = AppConfig.ensure(CONFIG_PATH)

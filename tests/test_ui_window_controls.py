@@ -836,6 +836,65 @@ def test_restore_waits_for_acrylic_before_clearing(app):
         app.processEvents()
 
 
+def test_global_qss_has_no_opaque_widget_fallback():
+    """`QWidget` 兜底规则**不得**画不透明背景。
+
+    它的影响面是**所有**控件（Qt 的类型选择器匹配子类），一旦给上半透明底色，
+    窗口里每一层嵌套容器都会各叠一层 —— 而窗口本身是半透明的，这些层真实叠加：
+    1 层桌面透过 28%、2 层 7.8%、3 层 2.2%、4 层以上几乎全黑。主窗口控件最深
+    嵌套 6 层，于是界面上出现一块块深浅不一的矩形（用户："黑色的斑块，
+    一点都不平滑"）。
+
+    ⚠️ 必须是**显式** `transparent`，不能靠"省略这一行"—— 省略会让没有单独
+    写底色的部件回落到系统调色板，实测表头会变成一条白带。
+    """
+    import re as _re
+
+    from ui import theme as _theme
+
+    css = _theme.build_stylesheet()
+    m = _re.search(r"QWidget \{(.*?)\n\}", css, _re.S)
+    assert m, "找不到 QWidget 兜底规则"
+    body = m.group(1)
+    assert "background-color: transparent" in body, (
+        "QWidget 兜底背景不是 transparent —— 每层嵌套容器会各叠一层底色，"
+        "在半透明窗口上形成深浅不一的块")
+
+
+def test_window_has_single_flat_background_layer(app):
+    """全窗只能有**一层**底板，不得出现深浅不一的块。
+
+    这是"界面有黑色斑块"的直接守卫：采样窗口内若干**容器空白处**（不是按钮、
+    不是文字），比较各自的 alpha。
+
+    实测（本机）：修复前 196~251（极差 55，肉眼可见的块）；修复后 183（极差 3）。
+    """
+    win = _make_main()
+    try:
+        win.resize(1000, 620)
+        win.show()
+        app.processEvents()
+        img = win.grab().toImage()
+
+        pts = [(60, 18), (300, 18), (60, 300), (700, 320),
+               (60, 460), (60, 600), (940, 600)]
+        vals = []
+        for x, y in pts:
+            c = img.pixelColor(x, y)
+            if c.lightness() > 150:
+                continue        # 撞上了文字或亮色控件，跳过
+            vals.append(c.alpha())
+
+        assert len(vals) >= 4, "采样点大多落在文字上，本用例失去区分力"
+        spread = max(vals) - min(vals)
+        assert spread <= 8, (
+            f"各区域不透明度极差 {spread}（取值 {sorted(set(vals))}）—— "
+            f"说明有多层容器各自画了背景，界面上会出现深色块")
+    finally:
+        win.close()
+        app.processEvents()
+
+
 def test_native_blur_is_off_by_default():
     """原生模糊默认**关闭** —— 这是当前的产品决策，不能被随手打开。
 

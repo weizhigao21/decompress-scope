@@ -33,6 +33,16 @@ from ui import theme  # noqa: E402
 # 所以「最小通道 > 120」只会命中的图形本身，不会命中背景。
 GLYPH_MIN_CHANNEL = 120
 CHECK_MIN_CHANNEL = 200
+# 判定"实色笔画"的 alpha 下限。
+#
+# ⚠️ `QWidget.grab()` 会**原样保留半透明像素的 RGB**：`::indicator` 那层
+# `rgba(255,255,255,0.075)` 的底色抓出来是 `#ffffff / alpha=19` —— 只看 RGB
+# 就是"纯白"，会被算成画上去的图形。真正的笔画是**不透明**的（勾是纯白
+# alpha=255，三角是 TEXT_MUTED 实色），所以必须一起看 alpha。
+#
+# 这个坑是窗口底板改成透明后才暴露的：此前那层底色叠在深色底板上，
+# 抓出来是深灰，RGB 判据自然通过。
+SOLID_ALPHA = 128
 
 
 @pytest.fixture(scope="module")
@@ -76,11 +86,17 @@ def _grab(widget) -> QImage:
 
 
 def _glyph_pixels(img: QImage, x_from: int, x_to: int, floor: int) -> int:
-    """统计 [x_from, x_to) 区间内亮于 floor 的像素数（只看笔画核心，不管抗锯齿边缘）。"""
+    """统计 [x_from, x_to) 区间内亮于 floor 的**实色**像素数。
+
+    只看笔画核心，不管抗锯齿边缘；且必须是**不透明**像素（见 `SOLID_ALPHA`
+    —— 半透明的底色在 `grab()` 里同样是纯白 RGB，只看颜色会误判成图形）。
+    """
     n = 0
     for y in range(img.height()):
         for x in range(x_from, x_to):
             c = img.pixelColor(x, y)
+            if c.alpha() < SOLID_ALPHA:
+                continue
             if min(c.red(), c.green(), c.blue()) > floor:
                 n += 1
     return n
