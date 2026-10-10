@@ -1,6 +1,6 @@
 [project]
 name = "jieya-kaijing"
-version = "0.5.0"
+version = "0.6.0"
 description = "解压开镜 — 互联网多层压缩包自动处理：递归解压、密码提取与学习记录"
 requires-python = ">=3.10"
 

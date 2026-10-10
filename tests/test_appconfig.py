@@ -24,6 +24,8 @@ def test_defaults_are_sane(tmp_path):
     assert cfg.autorun_mode == AUTORUN_DIRECT
     assert cfg.open_after == OPEN_PATHS
     assert cfg.open_after in OPEN_ITEMS
+    # 右键解压：打开结果目录后顺手把进度窗口收掉（默认开，可在设置里关）
+    assert cfg.close_quick_after_open is True
     assert cfg.recent_inputs == []
     # 默认不建容器层：产物直接落在压缩包所在目录
     assert cfg.subdir_name == ""
@@ -41,6 +43,7 @@ def test_roundtrip(tmp_path):
         max_ratio=250.5,
         sniff_archives=False,
         keep_original=False,
+        close_quick_after_open=False,
         recent_inputs=["D:/a.zip", "D:/b.rar"],
         recent_inputs_limit=5,
     ).normalize()
@@ -77,6 +80,7 @@ def test_load_tolerates_bad_types_and_unknown_keys(tmp_path):
         "max_depth": "不是数字",
         "max_total_gb": None,
         "sniff_archives": "yes",
+        "close_quick_after_open": "no",
         "unknown_key": 123,
         "output_mode": "不存在的模式",
         "recent_inputs": "不是列表",
@@ -86,6 +90,8 @@ def test_load_tolerates_bad_types_and_unknown_keys(tmp_path):
     assert cfg.max_depth == AppConfig().max_depth      # 类型不符 → 默认值
     assert cfg.max_total_gb == AppConfig().max_total_gb
     assert cfg.sniff_archives is True                  # "yes" 能识别为真
+    # "no" 能识别为假 —— 顺带钉住字段名：名字写错会被当未知键丢弃、静默退回默认真
+    assert cfg.close_quick_after_open is False
     assert cfg.output_mode == OUTPUT_SAMEDIR           # 越界枚举 → 纠正
     assert cfg.recent_inputs == []                     # 非列表 → 空
 

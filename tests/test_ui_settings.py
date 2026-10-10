@@ -59,6 +59,9 @@ def test_settings_window_smoke(app, tmp_path):
         assert win.residue_open_btn.property("ghost") == "true"
         assert not win.residue_open_btn.property("primary"), "不许有第二个 primary"
         assert win.context_menu_check.text().startswith("在资源管理器右键菜单")
+        # 右键解压打开结果目录后自动关窗：默认开，且默认可点（默认的 open_after 是开的）
+        assert win.close_after_open_check.isChecked() is True
+        assert win.close_after_open_check.isEnabled() is True
     finally:
         win.close()
     app.processEvents()
@@ -82,6 +85,7 @@ def test_settings_collect_roundtrip(app, tmp_path):
         win.skip_done_check.setChecked(False)
         win.timeout_spin.setValue(7200)
         win.source_edit.setText("  example.com  ")
+        win.close_after_open_check.setChecked(False)
 
         cfg = win._collect()
         assert cfg.output_mode == OUTPUT_WORKDIR
@@ -95,6 +99,9 @@ def test_settings_collect_roundtrip(app, tmp_path):
         assert cfg.skip_done is False
         assert cfg.extract_timeout == 7200
         assert cfg.password_source == "example.com", "来源两端空白应被规范化掉"
+        # 右键窗口的退场开关也要真的收进配置，而不只是停在界面上
+        assert cfg.close_quick_after_open is False, \
+            "「结果目录打开后关闭右键解压窗口」没进配置，界面就是个装饰"
     finally:
         win.close()
     app.processEvents()
@@ -135,6 +142,67 @@ def test_settings_collect_normalizes_over_range(app, tmp_path):
         assert cfg.subdir_name == ""
     finally:
         win.close()
+    app.processEvents()
+
+
+def test_close_after_open_follows_auto_open_switch(app, tmp_path):
+    """「关窗」依赖「自动打开」：后者关掉时前者必须就地禁用并说明原因。
+
+    留着可勾选就是界面在说谎 —— 用户会以为开了就生效，实际一次都不会发生
+    （右键窗口只在真的打开了目录之后才退场）。
+    """
+    from core.appconfig import AppConfig
+    from ui.settings_window import SettingsWindow
+
+    cfg_path = tmp_path / "cfg.json"
+    AppConfig().save(cfg_path)
+    win = SettingsWindow(AppConfig.ensure(cfg_path), cfg_path, tmp_path,
+                         db_path=tmp_path / "t.db")
+    try:
+        assert win.open_after_check.isChecked() is True
+        assert win.close_after_open_check.isEnabled() is True
+
+        win.open_after_check.setChecked(False)
+        app.processEvents()
+        assert win.close_after_open_check.isEnabled() is False, \
+            "不自动打开目录时，「关窗」勾了也不会触发，不该还让人勾"
+        assert "自动打开" in win.close_after_open_check.toolTip(), \
+            "禁用却不说原因，用户只会以为这个选项坏了"
+
+        win.open_after_check.setChecked(True)
+        app.processEvents()
+        assert win.close_after_open_check.isEnabled() is True
+    finally:
+        win.close()
+    app.processEvents()
+
+
+def test_close_after_open_survives_save_and_reload(app, tmp_path):
+    """关掉之后必须真的存住：右键窗口每次都是重新读配置文件的。"""
+    from core.appconfig import AppConfig
+    from ui.settings_window import SettingsWindow
+
+    cfg_path = tmp_path / "cfg.json"
+    AppConfig().save(cfg_path)
+    win = SettingsWindow(AppConfig.ensure(cfg_path), cfg_path, tmp_path,
+                         db_path=tmp_path / "t.db")
+    try:
+        win.close_after_open_check.setChecked(False)
+        win._on_save()
+        app.processEvents()
+    finally:
+        win.close()
+    app.processEvents()
+
+    assert AppConfig.ensure(cfg_path).close_quick_after_open is False, \
+        "存盘后被 normalize 打回了默认值"
+    # 再打开设置窗口时勾选状态要跟着配置文件走
+    win2 = SettingsWindow(AppConfig.ensure(cfg_path), cfg_path, tmp_path,
+                          db_path=tmp_path / "t.db")
+    try:
+        assert win2.close_after_open_check.isChecked() is False
+    finally:
+        win2.close()
     app.processEvents()
 
 

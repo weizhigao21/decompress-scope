@@ -88,6 +88,21 @@ _OUTPUT_HINTS = {
     OUTPUT_WORKDIR: "统一解到隔离工作目录，成功后按需复制一份回压缩包所在目录。",
 }
 
+# 「结果目录打开后关闭右键解压窗口」的两种说明：生效时讲它做什么，失效时讲它
+# 为什么不生效。只留前者的话，用户会在自动打开关掉后对着一个勾不动的复选框猜。
+_CLOSE_AFTER_OPEN_TIP = (
+    "右键菜单解压：结果目录自动打开之后，程序把那个进度窗口一并收掉，"
+    "桌面上只留资源管理器里的产物。\n"
+    "关掉它，窗口会留着等你点「关闭」或「打开结果目录」。\n"
+    "只影响右键进来的紧凑窗口，主窗口不受影响；密码、失败、跳过等需要你看一眼的"
+    "情况一律不关。"
+)
+_CLOSE_AFTER_OPEN_DISABLED_TIP = (
+    "当前「解压完成后自动打开结果目录」是关的：既然不自动打开目录，"
+    "就没有「打开之后」这一步可关，窗口会一直留着。\n"
+    "想让它生效，请先勾选上面的「解压完成后自动打开结果目录」。"
+)
+
 # 标签列的固定宽度：左对齐后各页的行首才能连成一条竖线。
 # 取「最大嵌套深度」（6 字 ≈ 78px）+ 余量，各页共用同一个值。
 _LABEL_W = 88
@@ -406,7 +421,12 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self.open_after_check.setToolTip(
             "完成后用资源管理器打开产物的所在目录（右键菜单的解压窗口同样遵守）。"
             "取消勾选则什么都不打开 —— 原先设为「打开隔离工作目录」的，取消后也会一并关掉")
+        self.open_after_check.toggled.connect(self._sync_behavior_dependents)
         form.addRow(self._field_label("完成后"), self.open_after_check)
+
+        self.close_after_open_check = QCheckBox("结果目录打开后关闭右键解压窗口")
+        self.close_after_open_check.setToolTip(_CLOSE_AFTER_OPEN_TIP)
+        form.addRow(self._field_label("右键窗口"), self.close_after_open_check)
 
     def _page_appearance(self, col: QVBoxLayout) -> None:
         """外观页：目前只有一项，但它是唯一能调「整窗底色深浅」的地方。
@@ -606,10 +626,12 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self.keep_mid_check.setChecked(cfg.delete_intermediate is False)
         self.delete_orig_check.setChecked(cfg.keep_original is False)
         self.open_after_check.setChecked(cfg.open_after != OPEN_NONE)
+        self.close_after_open_check.setChecked(cfg.close_quick_after_open)
         self.opacity_spin.setValue(cfg.window_opacity)
         self.keep_days_spin.setValue(cfg.session_days)
 
         self._sync_output_dependents()
+        self._sync_behavior_dependents()
         self._refresh_attempts_hint()
         self._refresh_history_label(cfg)
         self._refresh_residue()
@@ -642,6 +664,7 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
             # 「打开隔离工作目录」那一档是 workdir 时代的旧行为，不再在 UI 上暴露，
             # 但 core 仍认它（老配置文件不会因此失效）。
             open_after=OPEN_PATHS if self.open_after_check.isChecked() else OPEN_NONE,
+            close_quick_after_open=self.close_after_open_check.isChecked(),
             window_opacity=self.opacity_spin.value(),
             session_days=self.keep_days_spin.value(),
         ).normalize()
@@ -671,6 +694,18 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
             "仅「解压到隔离工作目录」模式有意义。关闭 = 源目录完全不被动过"
             if isolated else
             "当前是「解压到压缩包所在目录」模式，产物直接落在源目录旁，无需复制回来")
+
+    def _sync_behavior_dependents(self) -> None:
+        """「结果目录打开后关闭右键解压窗口」依赖「完成后自动打开结果目录」。
+
+        自动打开关掉时，这个动作永远不会触发（右键窗口只在**真的打开了目录**
+        之后才退场）。留着可勾选就是界面在说谎 —— 用户会以为开了就生效，
+        实际一次都不会发生。就地禁用，并把原因写进 tooltip。
+        """
+        opened = self.open_after_check.isChecked()
+        self.close_after_open_check.setEnabled(opened)
+        self.close_after_open_check.setToolTip(
+            _CLOSE_AFTER_OPEN_TIP if opened else _CLOSE_AFTER_OPEN_DISABLED_TIP)
 
     def _refresh_history_label(self, cfg: AppConfig) -> None:
         n = len(cfg.recent_inputs or [])

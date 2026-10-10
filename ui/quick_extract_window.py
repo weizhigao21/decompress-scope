@@ -30,6 +30,11 @@ PROJECT_ROOT = runtime_data_root(Path(__file__).resolve().parent.parent)
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
+# 自动打开结果目录之后，本窗退场的延迟。不立刻 close()：那样前台焦点会先回到
+# 此前的窗口，而资源管理器刚被拉起、还没来得及露头 —— 用户看到的是"窗口没了、
+# 目录也没打开"。留一点时间让它先出现，再让本窗消失。
+_CLOSE_AFTER_OPEN_DELAY_MS = 400
+
 
 class QuickExtractWindow(GlassWindowMixin, QDialog):
     """不显示选项的单路径解压窗口：打开即运行，例外才询问密码或报错。
@@ -313,22 +318,31 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "解压开镜", message)
 
-    def _open_results(self, limit: int | None = None) -> None:
-        """打开结果目录。`limit` 用于自动打开时的抑制（见 `_maybe_open_results`）。"""
+    def _open_results(self, limit: int | None = None) -> int:
+        """打开结果目录，返回**实际打开**的目录数。
+
+        返回值是给 `_maybe_open_results` 判断"到底开成了没有"用的：偏好开着、
+        但目录一个都不存在（交付失败、被手动挪走）时绝不能顺手把窗口关掉 ——
+        那会让用户连"产物在哪"这句提示都看不到。
+        `limit` 用于自动打开时的抑制（见 `_maybe_open_results`）。
+        """
         if self._report is None:
-            return
+            return 0
         dirs = [Path(raw) for raw in (self._report.output_dirs or [])]
         dirs = [d for d in dirs if d.is_dir()]
         if limit is not None:
             dirs = dirs[:limit]
+        opened = 0
         for path in dirs:
             try:
                 os.startfile(str(path))  # noqa: S606 Windows Explorer 入口
             except OSError:
                 continue
+            opened += 1
+        return opened
 
     def _maybe_open_results(self) -> None:
-        """按偏好决定是否**自动**打开结果目录。
+        """按偏好决定是否**自动**打开结果目录，并按偏好让本窗退场。
 
         偏好是 `open_after`，与主窗口共用同一个开关 —— 否则用户会发现
         "主窗口里关掉了、右键进来还是照开"。右键进入的多是"解完就想看"的
@@ -336,6 +350,11 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
 
         「打开隔离工作目录」那一档是 workdir 时代的旧行为，右键窗口没有
         workdir 视图，按"打开产物目录"处理 —— 那才是用户此刻想去的地方。
+
+        `close_quick_after_open`（设置 → 解压行为）是右键窗口独有的后续动作：
+        目录**真的打开之后**把本窗收掉。它挂在"打开成功"这个前提上，而不是挂在
+        "解压完成"上 —— 没打开目录就把窗口关掉，用户会既看不到产物位置、也没
+        「打开结果目录」可点。
         """
         if self._report is None or not self._report.output_dirs:
             return
@@ -346,7 +365,19 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         if pref.open_after == OPEN_NONE:
             return
         # 与主窗口同一策略：一次解出十几个目录时全开会淹没桌面，超过 5 个只开第一个。
-        self._open_results(limit=1 if len(self._report.output_dirs) > 5 else None)
+        opened = self._open_results(limit=1 if len(self._report.output_dirs) > 5 else None)
+        if opened and pref.close_quick_after_open:
+            self._schedule_close_after_open()
+
+    def _schedule_close_after_open(self) -> None:
+        """把退场排在资源管理器露头之后（延迟值见 `_CLOSE_AFTER_OPEN_DELAY_MS`）。"""
+        QTimer.singleShot(_CLOSE_AFTER_OPEN_DELAY_MS, self._close_when_done)
+
+    def _close_when_done(self) -> None:
+        """关窗：线程还在收尾就交给 `_on_thread_finished`，不重复走取消流程。"""
+        self._close_when_finished = True
+        if self._thread is None or not self._thread.isRunning():
+            self.close()
 
     def _request_cancel(self) -> None:
         if self._thread is None or not self._thread.isRunning():
