@@ -58,6 +58,9 @@ class Pipeline:
         self._on_event = None  # 可选事件回调: on_event(dict)，供 UI 桥接
         self._should_cancel = None  # 可选取消探测: should_cancel() -> bool
         self._ask_password = None  # 可选问询回调: ask_password({"path": ...}) -> str | None
+        # 可选先手密码探针: password_ready() -> str | None（UI 上已填好、还没等
+        # pipeline 开口问的那个密码）。与 _ask_password 的分工见 _early_user_password。
+        self._password_ready = None
         # 输出落地策略（由 UI/CLI 注入；默认沿用旧的隔离工作目录行为）
         self.output_mode = OUTPUT_WORKDIR
         # 容器目录名：留空 = 产物直接落在压缩包所在目录，不再套一层容器
@@ -82,6 +85,24 @@ class Pipeline:
     def _cancel_requested(self) -> bool:
         cb = self._should_cancel
         return bool(cb()) if cb else False
+
+    def _early_user_password(self) -> str:
+        """用户**先手**输入的密码（UI 上已经填好、pipeline 还没开口问）。无则空串。
+
+        和 `_ask_password` 的分工：那个是"候选全失败后现场问、阻塞等回答"；
+        这个只做**探测**（不消费、不回答），由候选循环每轮问一次 —— 从右键进来的
+        用户常常手里就攥着密码，让他等着 20 个候选挨个跑完（7z-AES 每个约 0.3 s）
+        纯属浪费。一探到输入，就把它插到最前面试。
+
+        探针本身不许把 pipeline 搞崩：UI 侧的任何异常都按"没有先手密码"处理。
+        """
+        cb = self._password_ready
+        if cb is None:
+            return ""
+        try:
+            return (cb() or "").strip()
+        except Exception:
+            return ""
 
     def _looks_like_archive(self, path: Path) -> bool:
         """扩展名优先判定；未命中且开启嗅探时读文件头 magic 兜底。
@@ -216,6 +237,7 @@ class Pipeline:
         on_event=None,
         should_cancel=None,
         ask_password=None,
+        password_ready=None,
     ) -> RunReport:
         """可选回调（均为普通可调用对象，core 不依赖任何 UI 框架）:
 
@@ -226,12 +248,16 @@ class Pipeline:
         - ask_password({"path": ...}) -> str | None:
           密码候选全部失败时现场询问（如 UI 弹窗），返回密码则立即重试，
           返回 None/空 则该包进入 needs_password。
+        - password_ready() -> str | None: 用户**先手**填好的密码（不等 pipeline
+          开口问）。候选循环每轮探一次，一有输入就插到最前面试 —— 密码是从 UI
+          输入框直接拿的，天然比"文件名/域名/密码库"推导出来的候选更可靠。
 
         输出落点由 self.output_mode / self.subdir_name 决定（见 core.output_plan）。
         """
         self._on_event = on_event
         self._should_cancel = should_cancel
         self._ask_password = ask_password
+        self._password_ready = password_ready
         self._plans.clear()
         self._input_aliases.clear()
         self._joined_volume_paths.clear()
@@ -721,6 +747,10 @@ class Pipeline:
 
         预筛通过仍需完整解压确认。密码错误换下一个，其他失败保留现场。
 
+        用户**先手输入**的密码优先：每轮候选之前都探一次 `password_ready()`，
+        一有输入就插到最前面试，不等候选跑完。先手密码试错也不扔——记进 seen 后
+        继续按顺序试候选（自动匹配的能力不丢），最后仍会回到现场重问。
+
         候选全部失败后，若注册了 ask_password 回调（UI 弹窗等），现场询问密码
         并立即重试，最多 3 次；用户放弃则进入 needs_password。
         """
@@ -737,6 +767,25 @@ class Pipeline:
         for index, pwd in enumerate(attempts):
             if self._cancel_requested():
                 return AttemptOutcome(message="用户取消", password_issue=False)
+            early = self._early_user_password()
+            if early and early not in seen:
+                # 用户先手填好了密码：插到最前面试。注意这里**不** break ——
+                # 试错就回到候选顺序继续（seen 已记下，不会把这个密码再试一遍）。
+                seen.add(early)
+                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                            "message": "正在用你输入的密码解压"})
+                result = self._run_extract(task_id, archive, out_dir, early)
+                if result is None:
+                    return AttemptOutcome(message="用户取消", password_issue=False)
+                code, out, err = result
+                ok, wrong_pw, msg = classify_extract(code, out, err)
+                if ok:
+                    return AttemptOutcome(password=early)
+                last_msg = msg
+                if not wrong_pw:
+                    return AttemptOutcome(message=last_msg, password_issue=False)
+                shutil.rmtree(out_dir, ignore_errors=True)
+                continue
             if pwd:
                 percent = (index - 1) * 100 // total
                 if percent != last_percent:

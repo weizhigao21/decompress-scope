@@ -37,7 +37,11 @@ _CLOSE_AFTER_OPEN_DELAY_MS = 400
 
 
 class QuickExtractWindow(GlassWindowMixin, QDialog):
-    """不显示选项的单路径解压窗口：打开即运行，例外才询问密码或报错。
+    """不显示选项的单路径解压窗口：打开即运行，例外才报错。
+
+    密码输入区**常驻**：不必等后台把候选密码试完才亮出来。用户先手填好的密码会
+    被 pipeline 在下一轮候选前插到最前面试（core 的 `password_ready` 探针）；
+    用户不填就照旧自动匹配，matched 就直接解压。
 
     同样是**无边框 + 半透明底板**：右键进入的窗口与主界面必须是一套外观，
     否则用户会觉得从右键打开的是"另一个软件"。
@@ -57,14 +61,20 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self._current_name = ""
         self._password_prompts = 0
         self._password_path = ""
+        # pipeline 是否正阻塞在"现场问密码"上（need_password 已发、还没收到回答）。
+        # 只有它为真时「跳过此包」才有意义 —— pipeline 自己还在试候选的时候，
+        # 没有什么可跳过的（要停就点「取消」）。
+        self._waiting_for_pipeline = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self._refresh_status)
 
         self.setWindowTitle("解压开镜")
         self.setMinimumWidth(460)
-        self.resize(460, 190)
         self._build_ui()
+        # 密码输入区是**常驻**的：窗口按内容高度走，不再按"面板藏起来"的 190 算，
+        # 否则输入框会被裁掉一截。
+        self.adjustSize()
         if autostart:
             QTimer.singleShot(0, self._start)
 
@@ -101,11 +111,15 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self.status_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
         layout.addWidget(self.status_label)
 
+        # 密码输入区**常驻**：不必等后台把候选密码试完才亮出来。用户手里攥着密码时
+        # （站点公告、封面注释、前人经验），打开窗口就能直接填，填完 pipeline 会在
+        # 下一轮候选前把它插到最前面试（见 core 的 password_ready 探针）。
+        # 留空也行 —— 自动匹配照常跑， matched 就直接解压，不用你管。
         self.password_panel = QWidget(self)
         password_layout = QVBoxLayout(self.password_panel)
         password_layout.setContentsMargins(0, 2, 0, 2)
         password_layout.setSpacing(8)
-        self.password_hint = QLabel("请输入压缩包密码：")
+        self.password_hint = QLabel("已知密码可直接输入（留空 = 自动尝试）：")
         password_layout.addWidget(self.password_hint)
         password_row = QHBoxLayout()
         self.password_input = QLineEdit()
@@ -117,10 +131,12 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self.password_button.clicked.connect(self._submit_password)
         password_row.addWidget(self.password_button)
         self.skip_button = QPushButton("跳过此包")
+        self.skip_button.setEnabled(False)   # 只有 pipeline 开口问时才可跳
+        self.skip_button.setToolTip(
+            "等自动密码试完、程序开口问的时候才需要跳过；想整个停掉请点「取消」")
         self.skip_button.clicked.connect(self._skip_password)
         password_row.addWidget(self.skip_button)
         password_layout.addLayout(password_row)
-        self.password_panel.hide()
         layout.addWidget(self.password_panel)
 
         row = QHBoxLayout()
@@ -239,6 +255,11 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self.status_label.setText(text)
 
     def _on_need_password(self, info: dict) -> None:
+        """pipeline 现场问密码：候选全没命中，轮到用户。
+
+        输入区本来就是亮的，这里只负责把状态切到"等回答"：换提示文案、聚焦、
+        放开「跳过此包」。
+        """
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self._last_percent = None
@@ -254,28 +275,38 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
             else "密码不正确，请重新输入："
         )
         self.password_input.clear()
-        self.password_panel.show()
-        self.adjustSize()
+        self._waiting_for_pipeline = True
+        self.skip_button.setEnabled(True)
         self.password_input.setFocus(Qt.FocusReason.OtherFocusReason)
         self._set_stage("等待输入密码")
 
     def _submit_password(self) -> None:
+        """提交密码。pipeline 问不问都收：问着就当场用，没问就算"先手输入"。"""
         pwd = self.password_input.text().strip()
         if not pwd:
-            self.password_hint.setText("请先输入密码，或点击“跳过此包”。")
+            self.password_hint.setText(
+                "请先输入密码，或点击“跳过此包”。" if self._waiting_for_pipeline
+                else "请先输入密码。")
             self.password_input.setFocus(Qt.FocusReason.OtherFocusReason)
             return
-        self.password_panel.hide()
+        # 输入区常驻：不清空、不收起，只把"已收到"说出来。清空输入框是给下一轮
+        # （可能是这个包重问，也可能是下一个包）留的，用户一眼能看出该重新填了。
         self.password_input.clear()
-        self.adjustSize()
+        self.password_hint.setText("已收到，正在用这个密码解压…")
+        self._waiting_for_pipeline = False
+        self.skip_button.setEnabled(False)
         if self._worker is not None:
+            # pipeline 正等着 → 当场解；还在试候选 → 进 worker 的待答队列，
+            # 候选循环下一轮就收手用它（见 core 的 password_ready 探针）。
             self._set_stage("正在验证输入的密码")
             self._worker.submit_password(pwd)
 
     def _skip_password(self) -> None:
-        self.password_panel.hide()
+        """放弃当前这个包。只在 pipeline 开口问时可点（见 skip_button 的启用条件）。"""
         self.password_input.clear()
-        self.adjustSize()
+        self.password_hint.setText("已跳过当前压缩包")
+        self._waiting_for_pipeline = False
+        self.skip_button.setEnabled(False)
         self._set_stage("已跳过当前压缩包")
         if self._worker is not None:
             self._worker.submit_password(None)
@@ -283,7 +314,10 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
     def _on_finished(self, report) -> None:
         self._report = report
         self._status_timer.stop()
+        # 跑完了：密码输入区没有存在意义，收起来（窗口也可能紧跟着自动退场）。
         self.password_panel.hide()
+        self._waiting_for_pipeline = False
+        self.skip_button.setEnabled(False)
         self.cancel_button.setText("关闭")
         self.cancel_button.clicked.disconnect()
         self.cancel_button.clicked.connect(self.close)
@@ -312,6 +346,8 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
     def _on_failed(self, message: str) -> None:
         self._status_timer.stop()
         self.password_panel.hide()
+        self._waiting_for_pipeline = False
+        self.skip_button.setEnabled(False)
         self.cancel_button.setText("关闭")
         self._show_error(message)
 

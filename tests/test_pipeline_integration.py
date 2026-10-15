@@ -138,6 +138,74 @@ def test_ask_password_give_up(tmp_path):
     assert report.needs_password == 1 and report.done == 0
 
 
+class _RecordingPipeline(Pipeline):
+    """记下每次真正交给 7z 的密码，用来断言"先手密码有没有插到最前面"。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.attempts: list[str] = []
+
+    def _run_extract(self, task_id, archive, out_dir, pwd):
+        self.attempts.append(pwd)
+        return super()._run_extract(task_id, archive, out_dir, pwd)
+
+
+def _recording_env(tmp_path: Path):
+    exe = _sevenzip_or_skip()
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    db = tmp_path / "app.db"
+    cfg = Config.create(sevenzip=str(exe), workdir=tmp_path / "wd")
+    pipe = _RecordingPipeline(cfg, PasswordVault(db), TaskStore(db))
+    return exe, inputs, pipe
+
+
+def test_password_ready_preempts_candidates(tmp_path):
+    """先手密码一到就插到最前面：连空密码都不试，候选更不试。"""
+    exe, inputs, pipe = _recording_env(tmp_path)
+    (inputs / "a.txt").write_text("x", encoding="utf-8")
+    _run7z(exe, ["a", "-psecret9", "hush.zip", "a.txt"], inputs)
+
+    report = pipe.run([inputs], password_ready=lambda: "secret9")
+
+    assert report.done == 1 and report.needs_password == 0 and report.failed == 0
+    assert pipe.attempts == ["secret9"], (
+        f"先手密码应当第一个上，实际顺序 {pipe.attempts} —— 用户白等了一轮候选")
+
+
+def test_password_ready_arriving_late_is_still_used(tmp_path):
+    """密码来得晚一点（空密码已经试过）也照样插到剩余候选前面。"""
+    exe, inputs, pipe = _recording_env(tmp_path)
+    (inputs / "a.txt").write_text("x", encoding="utf-8")
+    _run7z(exe, ["a", "-psecret9", "hush.zip", "a.txt"], inputs)
+
+    calls = {"n": 0}
+
+    def ready():
+        # 前两次（空密码那一轮及其后）还没有输入，第三次起用户填好了
+        calls["n"] += 1
+        return "secret9" if calls["n"] >= 3 else None
+
+    report = pipe.run([inputs], password_ready=ready)
+
+    assert report.done == 1 and report.needs_password == 0
+    assert pipe.attempts == ["", "secret9"], (
+        f"期望 [空密码, 用户密码]，实际 {pipe.attempts}")
+
+
+def test_password_ready_wrong_still_falls_back_to_candidates(tmp_path):
+    """先手密码填错了不许把自动匹配的能力弄丢：候选照旧接着试。"""
+    exe, inputs, pipe = _recording_env(tmp_path)
+    (inputs / "a.txt").write_text("x", encoding="utf-8")
+    _run7z(exe, ["a", "-psecret9", "hush[密码：secret9].zip", "a.txt"], inputs)
+
+    report = pipe.run([inputs], password_ready=lambda: "nope")
+
+    assert report.done == 1, "用户填错密码后，文件名里本来有的正确候选没被接着试"
+    assert "nope" in pipe.attempts and "secret9" in pipe.attempts
+    assert pipe.attempts.index("secret9") > pipe.attempts.index("nope")
+
+
 def test_should_cancel(tmp_path):
     """取消探测返回 True → 不处理任何任务，并给出取消警告。"""
     exe, inputs, cfg, vault, pipe = _make_env(tmp_path)
