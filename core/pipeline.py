@@ -902,7 +902,7 @@ class Pipeline:
         """workdir 模式下把最外层任务的产物交付回源压缩包所在目录。
 
         同卷走 rename（单个原子系统调用，省一半写入与磁盘），跨卷才逐文件复制。
-        尽力而为：目标已存在则避让到「包名 (2)」，空间不足/无权限记一条警告并把
+        尽力而为：目标已存在则避让到「包名~2」，空间不足/无权限记一条警告并把
         失败**落库**（delivery_error），任务状态仍算成功——解压本身没出错。
         警告同时进 report 与事件流：CLI 只读 report，UI 只读事件流，两边都不能瞎。
         """
@@ -916,8 +916,14 @@ class Pipeline:
             if not src.is_dir():
                 continue
 
-            # 目标已存在则避让到 "包名 (2)"，与前一份产物并存（绝不覆盖）
-            target = dst if plan.overwrite else (dst if not dst.exists() else unique_path(dst))
+            # 目标已存在则避让到 "包名~2"，与前一份产物并存（绝不覆盖）。
+            # 覆盖只对已存在的同名**目录**成立（合并进它）；同名位置是文件时
+            # 无法合并——无扩展名的包，其目录路径正是包文件本身，往那里写
+            # 只会得到 WinError 183。这条判断同时兜住 plan 算完后的竞态。
+            if plan.overwrite and dst.is_dir():
+                target = dst
+            else:
+                target = dst if not dst.exists() else unique_path(dst)
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self._place_tree(src, target)

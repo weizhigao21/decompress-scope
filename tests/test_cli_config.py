@@ -235,12 +235,12 @@ def test_extract_skips_done_on_rerun_and_force_overrides(isolated_cli, tmp_path,
     out2 = capsys.readouterr().out
     assert rc2 == 0, out2
     assert "跳过" in out2, f"重跑未报告跳过：{out2}"
-    assert not (src / "p (2)").exists(), "重跑堆出了重复产物目录"
+    assert not (src / "p~2").exists(), "重跑堆出了重复产物目录"
 
     rc3 = cli.main([*args, "--force"])
     out3 = capsys.readouterr().out
     assert rc3 == 0, out3
-    assert (src / "p (2)" / "a.txt").is_file(), f"--force 未重新解压：{out3}"
+    assert (src / "p~2" / "a.txt").is_file(), f"--force 未重新解压：{out3}"
 
 
 def test_extract_rejects_non_positive_timeout(isolated_cli, tmp_path, capsys):

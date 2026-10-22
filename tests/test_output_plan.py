@@ -55,19 +55,19 @@ def test_explicit_subdir_name_still_adds_a_container_layer(tmp_path):
 
 
 def test_samedir_avoids_overwriting_existing(tmp_path):
-    """同名目录已存在 → 自动避让为 "包名 (2)"，绝不覆盖既有产物。"""
+    """同名目录已存在 → 自动避让为 "包名~2"，绝不覆盖既有产物。"""
     cfg = _cfg(tmp_path)
     base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
 
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR)
-    assert plan.out_dir.name == "comic (2)"
+    assert plan.out_dir.name == "comic~2"
     assert plan.out_dir.parent == base.parent
 
-    # 再解一次 → (3)
-    (base.parent / "comic (2)").mkdir()
+    # 再解一次 → ~3
+    (base.parent / "comic~2").mkdir()
     plan2 = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR)
-    assert plan2.out_dir.name == "comic (3)"
+    assert plan2.out_dir.name == "comic~3"
 
 
 def test_samedir_overwrite_when_enabled(tmp_path):
@@ -82,13 +82,31 @@ def test_samedir_overwrite_when_enabled(tmp_path):
     assert plan.overwrite is True
 
 
+def test_samedir_overwrite_never_targets_the_archive_file(tmp_path):
+    """无扩展名的包（文件名 == 产物目录名）不能被当成交付目标。
+
+    `RJ01116988` 这类包在百度网盘很常见：包名与目录名完全相同，产物目录路径
+    就是包文件本身的路径。覆盖模式若照直往它写，makedirs 撞上已存在的文件会
+    抛 WinError 183（「当文件已存在时，无法创建该文件」），解压成果只能压在
+    工作目录里。此时必须照常避让。
+    """
+    cfg = _cfg(tmp_path, overwrite_existing=True)
+    archive = tmp_path / "src" / "RJ01116988"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"7z\xbc\xaf")
+    plan = plan_output(_task(tmp_path, "RJ01116988"), cfg, OUTPUT_SAMEDIR)
+
+    assert plan.final_dir == tmp_path / "src" / "RJ01116988~2"
+    assert plan.final_dir != archive, "交付目标变成了源包文件本身"
+
+
 def test_samedir_force_new_ignores_overwrite_flag(tmp_path):
     """force_new 优先于全局开关（给"再解一份"用）。"""
     cfg = _cfg(tmp_path, overwrite_existing=True)
     base = tmp_path / "src" / "comic"
     base.mkdir(parents=True)
     plan = plan_output(_task(tmp_path, "comic.cbz"), cfg, OUTPUT_SAMEDIR, force_new=True)
-    assert plan.out_dir.name == "comic (2)"
+    assert plan.out_dir.name == "comic~2"
 
 
 def test_nested_task_always_stays_in_workdir(tmp_path):
@@ -267,35 +285,35 @@ def test_copy_back_flag_ignored_in_samedir_mode(tmp_path):
 
 
 def test_unique_path_directory(tmp_path):
-    """目录避让：`pack` → `pack (2)`；序号递增。"""
+    """目录避让：`pack` → `pack~2`；序号递增。"""
     (tmp_path / "pack").mkdir()
-    assert unique_path(tmp_path / "pack").name == "pack (2)"
-    (tmp_path / "pack (2)").mkdir()
-    assert unique_path(tmp_path / "pack").name == "pack (3)"
+    assert unique_path(tmp_path / "pack").name == "pack~2"
+    (tmp_path / "pack~2").mkdir()
+    assert unique_path(tmp_path / "pack").name == "pack~3"
 
 
 def test_unique_path_file_keeps_extension_last(tmp_path):
-    """文件避让：`data.txt` → `data (2).txt`。
+    """文件避让：`data.txt` → `data~2.txt`。
 
-    回归：早期误用目录命名法得到 `data.txt (2)`，扩展名不再是最后一个
+    回归：若照搬目录命名法会得到 `data.txt~2`，扩展名不再是最后一个
     后缀，按后缀识别类型的程序会认不出该文件。
     """
     (tmp_path / "data.txt").write_text("x", encoding="utf-8")
     got = unique_path(tmp_path / "data.txt")
-    assert got.name == "data (2).txt"
+    assert got.name == "data~2.txt"
     assert got.suffix == ".txt", "扩展名必须是最后一个后缀"
 
 
 def test_unique_path_multi_suffix(tmp_path):
     """多段后缀：只保最后一段，序号插在主名后（多段后缀无法与主名里的点区分）。"""
     (tmp_path / "archive.tar.gz").write_text("x", encoding="utf-8")
-    assert unique_path(tmp_path / "archive.tar.gz").name == "archive.tar (2).gz"
+    assert unique_path(tmp_path / "archive.tar.gz").name == "archive.tar~2.gz"
 
 
 def test_unique_path_no_suffix(tmp_path):
     """无扩展名：序号直接接在名字后。"""
     (tmp_path / "README").write_text("x", encoding="utf-8")
-    assert unique_path(tmp_path / "README").name == "README (2)"
+    assert unique_path(tmp_path / "README").name == "README~2"
 
 
 def test_unique_path_returns_base_when_free(tmp_path):

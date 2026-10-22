@@ -195,7 +195,7 @@ def test_inner_name_clash_does_not_overwrite(tmp_path):
     assert report.done == 2, report.warnings
     delivered = inputs / "outer"
     assert (delivered / "inner" / "keep.txt").read_text(encoding="utf-8") == "kept"
-    assert (delivered / "inner (2)" / "deep.txt").is_file(), (
+    assert (delivered / "inner~2" / "deep.txt").is_file(), (
         f"同名冲突时内层产物被吞掉；实际 {_tree(delivered)}"
     )
 

@@ -83,7 +83,7 @@ def test_split_archive_output_has_no_archive_or_volume_suffix(tmp_path, mode):
 
 
 def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
-    """同名包解两次：第二次避让为 "pack (2)"，第一份产物不被覆盖。
+    """同名包解两次：第二次避让为 "pack~2"，第一份产物不被覆盖。
 
     注意 skip_done=False：默认的幂等跳过会在第二次直接跳过已完成的任务，
     走不到避让分支。这里显式关掉跳过，专测「避让而非覆盖」这一条不变式。
@@ -97,7 +97,7 @@ def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
     first.write_text("第一次的产物被改过", encoding="utf-8")
 
     pipe.run([inputs])
-    second_dir = inputs / "pack (2)"
+    second_dir = inputs / "pack~2"
     assert second_dir.is_dir()
     assert (second_dir / "note.txt").read_text(encoding="utf-8") == "解压开镜 payload"
     assert first.read_text(encoding="utf-8") == "第一次的产物被改过"
@@ -106,7 +106,7 @@ def test_samedir_twice_does_not_overwrite_first_run(tmp_path):
 def test_rerun_skips_already_done_archive(tmp_path):
     """幂等跳过：已成功解压且产物仍在的包，重跑时不再解一遍。
 
-    回归：旧实现每次重跑都从头解压，samedir 下堆出 `pack (2)`/`pack (3)`。
+    回归：旧实现每次重跑都从头解压，samedir 下堆出 `pack~2`/`pack~3`。
     用户把同一个下载目录反复拖进来（很常见的手势）就会越积越多。
     """
     exe, inputs, cfg, pipe = _make_env(tmp_path, OUTPUT_SAMEDIR)
@@ -119,7 +119,7 @@ def test_rerun_skips_already_done_archive(tmp_path):
 
     assert second.skipped == 1, "已完成的包没被跳过，重跑又解了一遍"
     assert second.done == 0, "跳过的任务不该计入成功"
-    assert not (inputs / "pack (2)").exists(), "重跑堆出了重复产物目录"
+    assert not (inputs / "pack~2").exists(), "重跑堆出了重复产物目录"
     assert any("跳过" in w for w in second.warnings), \
         f"跳过必须给出可解释的提示，否则用户会以为程序没反应：{second.warnings}"
 
@@ -155,7 +155,7 @@ def test_force_reprocess_extracts_again(tmp_path):
 
     assert second.skipped == 0
     assert second.done == 1
-    assert (inputs / "pack (2)" / "note.txt").is_file()
+    assert (inputs / "pack~2" / "note.txt").is_file()
 
 
 def test_changed_archive_is_not_skipped_even_when_output_exists(tmp_path):
@@ -244,7 +244,7 @@ def test_workdir_rerun_skips_after_same_volume_move(tmp_path):
 
     assert second.skipped == 1, "同卷交付后重跑未跳过（extracted_dir 未随搬走更新）"
     assert second.done == 0
-    assert not (inputs / "pack (2)").exists()
+    assert not (inputs / "pack~2").exists()
 
 
 def test_cross_volume_delivery_keeps_workdir_copy(tmp_path, monkeypatch):

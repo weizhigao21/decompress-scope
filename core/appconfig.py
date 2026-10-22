@@ -163,7 +163,7 @@ class AppConfig:
     sniff_archives: bool = True
     delete_intermediate: bool = True
     keep_original: bool = True
-    # 已成功解压过（产物仍在）的包，重跑时跳过，避免 samedir 下堆出 "包名 (2)/(3)"
+    # 已成功解压过（产物仍在）的包，重跑时跳过，避免 samedir 下堆出 "包名~2/~3"
     skip_done: bool = True
     # 单个压缩包的解压超时（秒）。默认 3600 对超大包偏紧，被误杀时调大
     extract_timeout: int = 3600

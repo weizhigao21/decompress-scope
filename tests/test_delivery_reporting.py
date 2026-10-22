@@ -213,6 +213,36 @@ def test_successful_delivery_points_extracted_dir_at_target(tmp_path):
     store.close()
 
 
+def test_overwrite_delivery_never_targets_the_archive_file(tmp_path):
+    """同名位置是**文件**（无扩展名的包本身）时，覆盖模式也必须避让。
+
+    旧实现按 plan.overwrite 直接把 target 定成那个路径：copytree 里的 makedirs
+    撞上已存在的文件 → WinError 183，解压成果只能压在工作目录里。界面弹出的
+    正是「交付到源目录失败 … 当文件已存在时，无法创建该文件」。
+    """
+    pipe, store, cfg = _mk_pipe(tmp_path)
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    archive = downloads / "RJ01116988"
+    archive.write_bytes(b"7z\xbc\xaf" * 8)
+    task = _mk_task(store, archive_path=str(archive), depth=0, status=TaskStatus.DONE)
+    out_dir = _mk_out_dir(cfg.workdir, task.id, "RJ01116988")
+    pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=archive,
+                                      copy_back=True, overwrite=True)
+
+    report = RunReport()
+    pipe._deliver([task], report)
+
+    delivered = downloads / "RJ01116988~2"
+    assert task.delivery_error == "", task.delivery_error
+    assert delivered.is_dir() and (delivered / "payload.bin").is_file()
+    assert archive.is_file() and archive.read_bytes() == b"7z\xbc\xaf" * 8, \
+        "源包绝不能被解压产物顶掉"
+    assert task.extracted_dir == str(delivered)
+    assert report.delivery_failed == 0
+    store.close()
+
+
 def test_no_copy_back_does_not_report_delivery_failure(tmp_path):
     """纯隔离模式（copy_back=False）不交付，也**不该**被记成交付失败。"""
     pipe, store, cfg = _mk_pipe(tmp_path)

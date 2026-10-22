@@ -265,7 +265,7 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
 
         self.overwrite_check = QCheckBox("直接覆盖，不自动改名避让")
         self.overwrite_check.setToolTip(
-            "关闭时（推荐）遇到同名目录自动改名为「xxx (2)」，绝不覆盖既有产物")
+            "关闭时（推荐）遇到同名目录自动改名为「xxx~2」，绝不覆盖既有产物")
         form2.addRow(self._field_label("同名产物"), self.overwrite_check)
 
         self.context_menu_check = QCheckBox("在资源管理器右键菜单显示“解压开镜”")

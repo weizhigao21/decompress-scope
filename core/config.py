@@ -51,7 +51,7 @@ class Config:
     keep_original: bool = True
     archive_exts: tuple[str, ...] = DEFAULT_ARCHIVE_EXTS
     sniff_archives: bool = True  # 扩展名未命中时读文件头 magic 识别伪装压缩包
-    # False 时同名输出目录自动避让为 "xxx (2)"，绝不覆盖既有产物
+    # False 时同名输出目录自动避让为 "xxx~2"，绝不覆盖既有产物
     overwrite_existing: bool = False
     # True 时已成功解压过（且有 DONE 记录）的包在重跑时跳过，不再解一遍
     skip_done: bool = True

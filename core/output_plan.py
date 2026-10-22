@@ -76,10 +76,10 @@ def archive_dir_name(archive) -> str:
 def unique_path(base: Path) -> Path:
     """找不冲突的路径：已存在时插入序号。
 
-    - 目录：`pack` → `pack (2)`
-    - 文件：`data.txt` → `data (2).txt`（序号插在主名与扩展名之间）
+    - 目录：`pack` → `pack~2`
+    - 文件：`data.txt` → `data~2.txt`（序号插在主名与扩展名之间）
 
-    第二种是关键：若照搬目录的命名法会得到 `data.txt (2)`，扩展名不再是
+    第二种是关键：若照搬目录的命名法会得到 `data.txt~2`，扩展名不再是
     最后一个后缀，很多程序按后缀识别类型时会认不出。多段后缀（`.tar.gz`）
     只保留最后一个作为扩展名，因为多段后缀无法与"主名里的点"区分开。
     """
@@ -88,14 +88,14 @@ def unique_path(base: Path) -> Path:
     suffix = base.suffix
     stem = base.name[: -len(suffix)] if suffix else base.name
     for i in range(2, 1000):
-        cand = base.with_name(f"{stem} ({i}){suffix}")
+        cand = base.with_name(f"{stem}~{i}{suffix}")
         if not cand.exists():
             return cand
     # 极端兜底：用纳秒时间戳，避免无限循环
     import time
 
     stamp = time.time_ns()
-    return base.with_name(f"{stem} ({stamp}){suffix}")
+    return base.with_name(f"{stem}~{stamp}{suffix}")
 
 
 def same_volume(a: Path, b: Path) -> bool:
@@ -156,15 +156,16 @@ def plan_output(    task,
     if force_new:
         final = unique_path(base)
         return OutputPlan(out_dir=final, final_dir=final)
-    if cfg.overwrite_existing:
+    # 覆盖语义只对「已存在的同名**目录**」成立——把解出来的树合并进它。
+    # 同名位置若是文件，则无从合并，硬写会 WinError 183：无扩展名的包
+    # `RJ01116988`（百度网盘常见）包名与产物目录名一模一样，它的目录路径
+    # 就是包文件自己的路径。这种情形必须照常避让成 "包名~2"。
+    if cfg.overwrite_existing and not base.is_file():
         return OutputPlan(
             out_dir=out_dir,
             final_dir=base,
             copy_back=True,
             overwrite=True,
         )
-    if not cfg.overwrite_existing:
-        final = unique_path(base)
-    else:
-        final = base
+    final = unique_path(base)
     return OutputPlan(out_dir=final, final_dir=final)
