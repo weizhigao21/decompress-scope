@@ -24,7 +24,7 @@ from core.config import Config
 from core.runtime_paths import runtime_data_root
 from ui import theme
 from ui.glass import GlassWindowMixin
-from ui.worker import ExtractWorker
+from ui.worker import CloudQueryJob, ExtractWorker
 
 PROJECT_ROOT = runtime_data_root(Path(__file__).resolve().parent.parent)
 DEFAULT_DB = PROJECT_ROOT / "data" / "jieya.db"
@@ -34,6 +34,11 @@ CONFIG_PATH = PROJECT_ROOT / "config.json"
 # 此前的窗口，而资源管理器刚被拉起、还没来得及露头 —— 用户看到的是"窗口没了、
 # 目录也没打开"。留一点时间让它先出现，再让本窗消失。
 _CLOSE_AFTER_OPEN_DELAY_MS = 400
+
+# 手动云解密的轮询间隔。后台线程只写结果、主线程来读：不做跨线程的 Qt 调用
+# （那会让 PySide6 6.12 随机 abort 整个进程，详见 ui/worker.py::CloudQueryJob）。
+# 150 ms 对"算完 MD5 + 发一个请求"这种秒级任务足够跟手，也不至于空转。
+_CLOUD_POLL_MS = 150
 
 
 class QuickExtractWindow(GlassWindowMixin, QDialog):
@@ -65,12 +70,29 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         # 只有它为真时「跳过此包」才有意义 —— pipeline 自己还在试候选的时候，
         # 没有什么可跳过的（要停就点「取消」）。
         self._waiting_for_pipeline = False
+        # 实际生效的密码（状态事件带回来的）。完成时显示出来：
+        # 用户最想知道的就是"这个包最后是用什么密码解开的"。
+        self._used_password = ""
+        # 乱码文件名修复的结论（notice 事件带回来的），完成时一并显示
+        self._repair_note = ""
+        # 同一件事的完整版（含编码与例子）。状态栏一行放不下，只挂 tooltip：
+        # 用户想知道"到底把什么改成了什么"时，得有个地方能看。
+        self._repair_detail = ""
+        # 手动「云端取密码」：后台线程跑一次查询，主线程定时轮询结果再上界面
+        # （不跨线程发 Qt 信号，理由见 ui/worker.py::CloudQueryJob）。
+        # 与 pipeline 里的自动云解密互不相干 —— 这里点了就查，不看偏好开关。
+        self._cloud_job: CloudQueryJob | None = None
+        self._cloud_timer = QTimer(self)
+        self._cloud_timer.setInterval(_CLOUD_POLL_MS)
+        self._cloud_timer.timeout.connect(self._poll_cloud)
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self._refresh_status)
 
         self.setWindowTitle("解压开镜")
-        self.setMinimumWidth(460)
+        # 密码行现在有四个控件（输入框 + 确认 + 云端 + 跳过），460 会把输入框
+        # 挤成一条缝。加宽到 520，其余尺寸仍按内容自适应。
+        self.setMinimumWidth(520)
         self._build_ui()
         # 密码输入区是**常驻**的：窗口按内容高度走，不再按"面板藏起来"的 190 算，
         # 否则输入框会被裁掉一截。
@@ -130,6 +152,16 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self.password_button = QPushButton("确认密码")
         self.password_button.clicked.connect(self._submit_password)
         password_row.addWidget(self.password_button)
+        # 手动云解密：pipeline 的自动云查询要等本地候选全失败（7z-AES 每候选
+        # 约 0.3 s），用户点这个按钮可以立刻按 MD5 去要密码。
+        self.cloud_button = QPushButton("云端取密码")
+        self.cloud_button.setToolTip(
+            "按文件 MD5 向云端密码库要这个包的密码：\n"
+            "· 不需要等本地候选试完，点了就查；\n"
+            "· 要算一遍整个文件的校验值，大包会先等几秒；\n"
+            "· 会消耗一次云端查询次数（与自动云解密共用额度）。")
+        self.cloud_button.clicked.connect(self._query_cloud)
+        password_row.addWidget(self.cloud_button)
         self.skip_button = QPushButton("跳过此包")
         self.skip_button.setEnabled(False)   # 只有 pipeline 开口问时才可跳
         self.skip_button.setToolTip(
@@ -213,8 +245,21 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         elif kind == "info":
             format_name = str(event.get("format") or "压缩包")
             self._set_stage(f"已识别 {format_name}，正在准备解压")
+        elif kind == "notice":
+            # pipeline 的补充说明（目前只有"已修正 N 个乱码文件名"这一类）。
+            # 记下来而不是立刻显示：这次事件发生在解压收尾阶段，紧接着就会
+            # 来 status=done，直接 setText 会被下一句覆盖掉，用户根本读不到。
+            text = str(event.get("message") or "").strip()
+            if text:
+                self._repair_note = text
+                self._repair_detail = str(event.get("detail") or text)
+                self._set_stage(text)
         elif kind == "status":
             status = event.get("status")
+            if event.get("password_used"):
+                # 云端/本地命中后 pipeline 会说用的是哪个密码：记下来，
+                # 完成时摆在状态栏里（用户最常问的一句就是"到底用的什么密码"）。
+                self._used_password = str(event["password_used"])
             if status == "probing":
                 self._set_stage("正在检查压缩包内容")
             elif status == "extracting":
@@ -270,10 +315,15 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         self._password_prompts += 1
         self._current_name = Path(password_path).name
         self.path_label.setText(self._current_name)
-        self.password_hint.setText(
-            "自动密码未匹配，请输入密码：" if self._password_prompts == 1
-            else "密码不正确，请重新输入："
-        )
+        # pipeline 会在 info 里带上最近一次云端结论（没启用/没查过则为空），
+        # 让用户知道"自动的、云端的都试过了"，而不是只看到"请输入密码"。
+        cloud_note = str(info.get("cloud") or "").strip()
+        if self._password_prompts == 1:
+            base, tail = "自动密码未匹配", "请输入密码"
+        else:
+            base, tail = "密码不正确", "请重新输入"
+        hint = f"{cloud_note}。{base}，{tail}：" if cloud_note else f"{base}，{tail}："
+        self.password_hint.setText(hint)
         self.password_input.clear()
         self._waiting_for_pipeline = True
         self.skip_button.setEnabled(True)
@@ -311,9 +361,74 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         if self._worker is not None:
             self._worker.submit_password(None)
 
+    def _query_cloud(self) -> None:
+        """手动向云端密码库要密码（后台线程，主线程轮询结果）。
+
+        查谁：优先当前正在等密码的那个包（`_password_path`，pipeline 问过才有），
+        否则第一个输入 —— 用户可能一开始就不想等，直接在满候选之前点它。
+        """
+        if self._cloud_job is not None and self._cloud_job.busy():
+            return                       # 上一次查询还没回来
+        target = self._password_path or (self._paths[0] if self._paths else "")
+        if not target:
+            return
+        try:
+            pref = AppConfig.ensure(CONFIG_PATH)
+            udid = pref.cloud_unlock_udid
+        except Exception:                # 偏好读不出来不影响查（走派生设备标识）
+            udid = ""
+        self.cloud_button.setEnabled(False)
+        self.cloud_button.setText("查询中…")
+        self.password_hint.setText("正在向云端密码库查询（要先把整个文件算一遍校验值）…")
+        self._set_stage("正在向云端密码库查询")
+        # 每次查询都用一个新的 job：上一个的线程可能刚结束，复用它会让
+        # 「点第二次没反应」这种状态藏起来。
+        self._cloud_job = CloudQueryJob(str(target), udid=udid)
+        self._cloud_job.start()
+        self._cloud_timer.start()
+
+    def _poll_cloud(self) -> None:
+        """主线程定时取结果。线程还在跑就等下一跳。"""
+        job = self._cloud_job
+        if job is None:
+            self._cloud_timer.stop()
+            return
+        result = job.poll()
+        if result is None:
+            if not job.busy():
+                # 线程已退但没留下结果：只可能是实现被改坏了，别让按钮永远转圈
+                self._cloud_timer.stop()
+                self.cloud_button.setEnabled(True)
+                self.cloud_button.setText("云端取密码")
+                self.password_hint.setText("云端查询没有返回结果")
+            return
+        self._cloud_timer.stop()
+        self._apply_cloud_result(result)
+
+    def _apply_cloud_result(self, result: dict) -> None:
+        """云端结论上界面：命中就交给解压线程，没命中就把原话摆出来。"""
+        result = result or {}
+        password = str(result.get("password") or "").strip()
+        message = str(result.get("message") or "").strip()
+        self.cloud_button.setEnabled(True)
+        self.cloud_button.setText("云端取密码")
+        if not password:
+            self.password_hint.setText(message or "云端密码库没有返回密码")
+            self._set_stage("云端密码库未返回密码")
+            return
+        self.password_hint.setText(f"云端密码库命中：{password}，正在用它解压…")
+        self._set_stage("正在用云端密码解压")
+        if self._worker is None:
+            # 解压线程已经收尾（没在等密码）：只把密码亮出来，别去戳已失效的对象
+            return
+        self._waiting_for_pipeline = False
+        self.skip_button.setEnabled(False)
+        self._worker.submit_password(password)
+
     def _on_finished(self, report) -> None:
         self._report = report
         self._status_timer.stop()
+        self._cloud_timer.stop()
         # 跑完了：密码输入区没有存在意义，收起来（窗口也可能紧跟着自动退场）。
         self.password_panel.hide()
         self._waiting_for_pipeline = False
@@ -334,7 +449,12 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
         elif report.output_dirs:
             self.progress.setRange(0, 100)
             self.progress.setValue(100)
-            self.status_label.setText(f"解压完成，已输出 {len(report.output_dirs)} 个结果目录")
+            used = f"（密码：{self._used_password}）" if self._used_password else ""
+            tail = f"；{self._repair_note}" if self._repair_note else ""
+            self.status_label.setText(
+                f"解压完成{used}，已输出 {len(report.output_dirs)} 个结果目录{tail}")
+            # 一行放不下例子，挂 tooltip 兜住"改成了什么"这个问题
+            self.status_label.setToolTip(self._repair_detail or "")
             self.open_button.setEnabled(True)
             self._maybe_open_results()
         elif report.skipped:
@@ -345,6 +465,7 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
 
     def _on_failed(self, message: str) -> None:
         self._status_timer.stop()
+        self._cloud_timer.stop()
         self.password_panel.hide()
         self._waiting_for_pipeline = False
         self.skip_button.setEnabled(False)
@@ -420,6 +541,7 @@ class QuickExtractWindow(GlassWindowMixin, QDialog):
             self.close()
             return
         self._close_when_finished = True
+        self._cloud_timer.stop()
         self.cancel_button.setEnabled(False)
         self.password_panel.hide()
         self._set_stage("正在取消")

@@ -13,6 +13,13 @@ from pathlib import Path
 
 from .appconfig import OUTPUT_SAMEDIR, OUTPUT_WORKDIR
 from .archive_detect import COMPOUND_ZIP_EXTS, VIDEO_EXTS, looks_like_archive, volume_info
+from .cloud_unlock import (
+    STATUS_ERROR,
+    STATUS_OK,
+    CloudQueryJob,
+    CloudResult,
+    build_unlocker,
+)
 from .embedded_zip import find_embedded_zip, prepare_embedded_zip
 from .config import Config
 from .models import ArchiveInfo, AttemptOutcome, Task, TaskStatus
@@ -24,11 +31,21 @@ from .output_plan import (
     unique_path,
 )
 from .password_finder import build_candidates, extract_source
+from .name_repair import repair_tree
 from .zip_password_filter import make_zip_password_filter
 from .probe import ProbeError, check_bomb, classify_extract, probe, probe_with_password
 from .sevenzip import SevenZip, SevenZipCancelled
 from .store import TaskStore
 from .vault import PasswordVault
+
+# 云端查询在本地候选跑完之后最多再等多久（秒）。
+#
+# 云端从第一秒就在后台跑（见 CloudQueryJob），所以正常情况下候选还没跑完它
+# 就回来了。只有候选极少（比如文件名里直接写着密码但猜错了）时才会走到"等它"：
+# 这时候它已经是最后一根稻草，值得等 —— 但必须封顶，否则一个连不上的网络会让
+# 每个加密包都卡满 socket 超时。真正的时间上限由 CloudUnlocker.timeout 决定，
+# 这里额外留一点余量给算 MD5。
+_CLOUD_WAIT_GRACE = 5.0
 
 
 @dataclass
@@ -47,6 +64,9 @@ class RunReport:
     delivery_failed_tasks: list[Task] = field(default_factory=list)
     output_dirs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # 既不是失败也不是警告的补充说明（例如"已修正 N 个乱码文件名"）。
+    # 单独立一个字段：混进 warnings 会让「结果里有警告」失去信息量。
+    notes: list[str] = field(default_factory=list)
 
 
 class Pipeline:
@@ -67,6 +87,14 @@ class Pipeline:
         self.subdir_name = ""
         self.copy_back = True  # workdir 模式下是否复制一份回源目录
         self.skip_done = getattr(cfg, "skip_done", True)  # 重跑时跳过已成功解压的包
+        # 云端密码库（云解密）：默认由 cfg 决定（关闭时为 None，绝不出网）。
+        # 测试直接把它换成一个假实现即可，不必碰网络。
+        self.cloud_unlock = build_unlocker(cfg)
+        # 同一轮里同一个文件只查一次云端：同一个包被拖两次、或内层重复时，
+        # 每一次查询都要烧对方一次配额（App 侧显示"剩余 N 次"）。
+        self._cloud_cache: dict[str, CloudResult] = {}
+        self._cloud_note = ""          # 最近一次云端结论，用于密码问询里交代一句
+        self._cloud_error_reported = False
         self._plans: dict[int, OutputPlan] = {}
         self._input_aliases: dict[str, str] = {}
         self._joined_volume_paths: dict[int, set[Path]] = {}
@@ -261,6 +289,9 @@ class Pipeline:
         self._plans.clear()
         self._input_aliases.clear()
         self._joined_volume_paths.clear()
+        self._cloud_cache.clear()
+        self._cloud_note = ""
+        self._cloud_error_reported = False
         report = RunReport()
         run_tasks: list[Task] = []
         queue: deque[Task] = deque()
@@ -439,7 +470,18 @@ class Pipeline:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._set(task, TaskStatus.EXTRACTING)
 
-        outcome = self._attempt_extract(archive, out_dir, candidates, task.id)
+        # 云端从第一秒就并行开跑（见 _attempt_extract），所以这里只决定
+        # "这个包值不值得查"：
+        # ① 必须真的加密（明文包第一轮空密码就成功了，根本走不到云端那一步，
+        #    这个条件只是兜底，防止哪天候选顺序变了就先烧掉一次查询）；
+        # ② 分卷包跳过：云端按**整包** MD5 索引，首卷的 MD5 与它对不上，
+        #    查了必然未收录，只会白烧一次配额（报告 §4.3 的 md5 是整包）。
+        cloud_ok = bool(info.flag_encrypted or info.needs_password_for_listing) \
+            and info.volume_count <= 1
+        outcome = self._attempt_extract(
+            archive, out_dir, candidates, task.id,
+            cloud_ok=cloud_ok, report=report,
+        )
         if outcome.password is None:
             # 失败/待密码时清掉空壳目录，避免 samedir 模式在用户目录留下痕迹
             self._discard_plan(plan)
@@ -475,6 +517,19 @@ class Pipeline:
         task.password_used = outcome.password or None
         if outcome.password:
             self.vault.record_success(outcome.password, task.source)
+
+        # ZIP 里不带 UTF-8 标志的文件名由 7z 按系统代码页（中文 Windows 上是 936）
+        # 解释，Shift-JIS 的日文包落盘就成了「擔杮岅偺僼傽僀儖柤」这种乱码。
+        # 必须趁产物还没被交付、没被当成内层包探测之前改回来 —— 一旦按乱码名
+        # 交付出去，用户拿到的就是一堆认不出的文件（见 core/name_repair.py）。
+        repair = repair_tree(plan.out_dir, archive=archive)
+        if repair.renamed:
+            report.notes.append(f"{archive.name}: {repair.describe()}")
+            # 界面列只放得下一句话，例子走 detail（悬停能看到）
+            self._emit({"kind": "notice", "task_id": task.id,
+                        "message": repair.summary(),
+                        "detail": repair.describe()})
+
         self._sweep_empty_dirs(plan)
         task.extracted_dir = str(plan.out_dir)
         self._enqueue_children(task, plan.out_dir, queue, run_tasks, report)
@@ -740,22 +795,115 @@ class Pipeline:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None
 
+    @staticmethod
+    def _cloud_cache_key(archive: Path) -> str:
+        """同一轮内的云端查询去重键。取不到元数据时返回空串（不去重）。"""
+        try:
+            stat = archive.stat()
+            resolved = archive.resolve()
+        except OSError:
+            return ""
+        return f"{resolved}:{stat.st_size}:{stat.st_mtime_ns}"
+
+    def _cloud_start(self, archive: Path, task_id: int
+                     ) -> tuple[CloudQueryJob | None, CloudResult | None]:
+        """开一个后台云端查询。返回 (任务, 已就绪的结论)。
+
+        两个返回值互斥：
+        - 本轮缓存里已经有这个文件的结论 → 直接给 (None, 结论)，不再发包（配额很贵）；
+        - 否则 (job, None)，查询在后台线程跑，主流程该试什么继续试。
+
+        云端**排在第一位**不是"先等它"，而是"它从第一秒就开始跑"：大包算 MD5
+        要几秒到几十秒，放在主流程里会把本地候选全堵在后面；反过来，本地候选
+        可能是两千条、7z-AES 每条 0.3 s，全跑完要十分钟。两条线并行，谁先出
+        结果用谁，命中即插队。
+
+        为什么另开线程的是云端、不是本地候选：候选每试一个都要跑一次 `7z.exe`
+        往**同一个** out_dir 里解，两条并行会互相踩产物；而 pipeline 本身在
+        GUI 里已经跑在工作线程上（右键窗口与主窗口都是 QThread），CLI 里也没有
+        别人在等。真正需要"另开线程"的只有云端这条纯 I/O（哈希 + 网络）的线。
+        """
+        unlocker = self.cloud_unlock
+        if unlocker is None:
+            return None, None
+        key = self._cloud_cache_key(archive)
+        cached = self._cloud_cache.get(key) if key else None
+        if cached is not None:
+            self._cloud_note = cached.message
+            return None, cached
+        self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                    "message": "正在向云端密码库查询（同时继续试本地密码）"})
+        job = CloudQueryJob(unlocker, archive, should_cancel=self._cancel_requested)
+        job.start()
+        return job, None
+
+    def _cloud_finish(self, result: CloudResult, archive: Path,
+                      report: RunReport | None) -> None:
+        """记住结论（本轮缓存 + 给问询用的一句话），失败时整轮只警告一条。"""
+        key = self._cloud_cache_key(archive)
+        if key:
+            self._cloud_cache[key] = result
+        self._cloud_note = result.message
+        if result.status == STATUS_ERROR and not self._cloud_error_reported:
+            self._cloud_error_reported = True
+            msg = (f"{archive.name}: 云端密码库查询失败 —— {result.message}"
+                   f"（本轮不再重试云端）")
+            if report is not None:
+                report.warnings.append(msg)
+            self._emit({"kind": "warning", "message": msg})
+
+    def _try_password(self, task_id: int, archive: Path, out_dir: Path, pwd: str,
+                      message: str = "正在解压") -> tuple[AttemptOutcome | None, str]:
+        """用这个密码解压一次。
+
+        返回 (结论, 错误消息)：结论非空 = 这一轮得有结果（成功 / 硬失败 / 取消）；
+        结论为空 = 密码不对（或可继续的情况），调用方接着试下一个，并把错误
+        消息留给最后的"密码均不匹配"。
+
+        抽出来是因为现在有三条入口都要走同一段"解压 → 判类 → 清现场"：用户先手
+        密码、云端密码、候选密码。三份复制粘贴的话，任何一处漏掉 rmtree 都会让
+        下一次尝试撞上残留产物。
+        """
+        self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                    "message": message})
+        result = self._run_extract(task_id, archive, out_dir, pwd)
+        if result is None:
+            return AttemptOutcome(message="用户取消", password_issue=False), ""
+        code, out, err = result
+        ok, wrong_pw, msg = classify_extract(code, out, err)
+        if ok:
+            return AttemptOutcome(password=pwd), ""
+        if not wrong_pw:
+            return AttemptOutcome(message=msg, password_issue=False), msg
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, msg
+
     def _attempt_extract(
-        self, archive: Path, out_dir: Path, candidates: list[str], task_id: int
+        self, archive: Path, out_dir: Path, candidates: list[str], task_id: int,
+        *, cloud_ok: bool = False, report: RunReport | None = None,
     ) -> AttemptOutcome:
         """空密码先试，再按候选顺序尝试；ZIP 先快速排除明显错误的候选。
 
-        预筛通过仍需完整解压确认。密码错误换下一个，其他失败保留现场。
+        三条线并行，谁先出结果用谁：
+        1. **用户先手密码** —— 每轮候选之前探一次 `password_ready()`，一有输入就
+           插到最前面试。试错也不扔：记进 seen 后继续按顺序试候选，最后仍会重问。
+        2. **云端密码库** —— `_cloud_start` 一进本函数就把查询丢到后台线程
+           （算 MD5 + 发包），主流程继续试本地候选；每轮候选前 poll 一次，
+           云端一命中就**立刻插队**用它解压，剩下的候选不再跑。
+        3. **本地候选** —— 文件名提示 / 来源派生 / 密码库 / 常用字典。
 
-        用户**先手输入**的密码优先：每轮候选之前都探一次 `password_ready()`，
-        一有输入就插到最前面试，不等候选跑完。先手密码试错也不扔——记进 seen 后
-        继续按顺序试候选（自动匹配的能力不丢），最后仍会回到现场重问。
+        为什么云端要"排第一"却不"先等它"：大包算 MD5 要几秒到几十秒，等它就是
+        把本地候选全堵在后面；而本地候选可能两千条、7z-AES 每条 0.29 s，全跑完
+        是十分钟级。两条线本来就是独立的，并行才是"谁都不等谁"。
 
-        候选全部失败后，若注册了 ask_password 回调（UI 弹窗等），现场询问密码
-        并立即重试，最多 3 次；用户放弃则进入 needs_password。
+        候选都试完、云端还没回来时才阻塞等它（封顶 `_CLOUD_WAIT_GRACE` +
+        查询超时）；它也没有才现场询问密码，最多 3 次；用户放弃则进入
+        needs_password。`cloud_ok` 由调用方判定"这个包值不值得查"
+        （见 _process_archive）。
         """
         attempts = [""]
         seen: set[str] = {""}
+        self._cloud_note = ""
         for cand in candidates:
             if cand and cand not in seen:
                 seen.add(cand)
@@ -764,6 +912,62 @@ class Pipeline:
         password_filter = None
         last_percent = -1
         total = len(attempts) - 1
+
+        cloud_job: CloudQueryJob | None = None
+        cloud_result: CloudResult | None = None
+        cloud_done = False          # 云端结论已经用过了，不再重复取
+        hash_bucket = {"pct": -10}
+
+        if cloud_ok:
+            cloud_job, cloud_result = self._cloud_start(archive, task_id)
+
+        def take_cloud(wait: bool = False) -> AttemptOutcome | None:
+            """取云端结论并试着解压。返回 None = 没有可用结论，继续本地流程。"""
+            nonlocal cloud_result, cloud_done
+            if cloud_done or (cloud_job is None and cloud_result is None):
+                return None
+            if cloud_result is None and cloud_job is not None:
+                if not wait:
+                    # 顺手把校验值进度报上去（在自己的线程里读、在自己的线程里发）
+                    pct = cloud_job.percent
+                    if pct - hash_bucket["pct"] >= 10:
+                        hash_bucket["pct"] = pct
+                        self._emit({
+                            "kind": "phase", "task_id": task_id, "percent": pct,
+                            "message": f"正在计算校验值… {pct}%（本地密码同时在试）",
+                        })
+                    cloud_result = cloud_job.poll()
+                    if cloud_result is None:
+                        return None
+                else:
+                    self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                                "message": "本地密码都试过了，正在等云端密码库"})
+                    limit = float(getattr(self.cfg, "cloud_unlock_timeout", 10.0) or 10.0)
+                    cloud_result = cloud_job.wait(limit + _CLOUD_WAIT_GRACE)
+                    if cloud_result is None:
+                        cloud_result = CloudResult(
+                            None, "云端查询超时（网络太慢或对方无响应）", STATUS_ERROR)
+            cloud_done = True
+            self._cloud_finish(cloud_result, archive, report)
+            pwd = cloud_result.password
+            if not pwd:
+                return None
+            if pwd in seen:
+                # 云端给的正是本地刚试过的那个：不必再花一次解压时间
+                self._cloud_note = "云端返回的密码与本地候选相同（已试过）"
+                return None
+            seen.add(pwd)
+            self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
+                        "message": f"云端密码库命中：{pwd}"})
+            outcome, msg = self._try_password(
+                task_id, archive, out_dir, pwd, message="正在用云端密码解压")
+            if outcome is not None:
+                return outcome
+            # 云端给了密码却解不开：库里这条记录已过期，或这个包被人替换过。
+            # 不能就此判失败——语义上仍是"密码不对"，继续走本地候选并问用户。
+            self._cloud_note = "云端返回的密码不正确（库里的记录可能已过期）"
+            return None
+
         for index, pwd in enumerate(attempts):
             if self._cancel_requested():
                 return AttemptOutcome(message="用户取消", password_issue=False)
@@ -772,20 +976,17 @@ class Pipeline:
                 # 用户先手填好了密码：插到最前面试。注意这里**不** break ——
                 # 试错就回到候选顺序继续（seen 已记下，不会把这个密码再试一遍）。
                 seen.add(early)
-                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
-                            "message": "正在用你输入的密码解压"})
-                result = self._run_extract(task_id, archive, out_dir, early)
-                if result is None:
-                    return AttemptOutcome(message="用户取消", password_issue=False)
-                code, out, err = result
-                ok, wrong_pw, msg = classify_extract(code, out, err)
-                if ok:
-                    return AttemptOutcome(password=early)
-                last_msg = msg
-                if not wrong_pw:
-                    return AttemptOutcome(message=last_msg, password_issue=False)
-                shutil.rmtree(out_dir, ignore_errors=True)
+                outcome, msg = self._try_password(
+                    task_id, archive, out_dir, early, message="正在用你输入的密码解压")
+                if outcome is not None:
+                    return outcome
+                last_msg = msg or last_msg
                 continue
+            # 云端插队点放在先手密码之后、本地候选之前：用户手里攥着密码时先试
+            # 他的；否则云端一有结论就立刻插队，不等候选跑完。
+            due = take_cloud()
+            if due is not None:
+                return due
             if pwd:
                 percent = (index - 1) * 100 // total
                 if percent != last_percent:
@@ -797,22 +998,18 @@ class Pipeline:
                 if password_filter is not None and not password_filter.may_match(pwd):
                     last_msg = "密码均不匹配"
                     continue
-            if pwd:
-                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
-                            "message": "正在解压"})
-            result = self._run_extract(task_id, archive, out_dir, pwd)
-            if result is None:
-                return AttemptOutcome(message="用户取消", password_issue=False)
-            code, out, err = result
-            ok, wrong_pw, msg = classify_extract(code, out, err)
-            if ok:
-                return AttemptOutcome(password=pwd)
-            last_msg = msg
-            if not wrong_pw:
-                return AttemptOutcome(message=last_msg, password_issue=False)
-            shutil.rmtree(out_dir, ignore_errors=True)
+            outcome, msg = self._try_password(task_id, archive, out_dir, pwd)
+            if outcome is not None:
+                return outcome
+            last_msg = msg or last_msg
             if not pwd:
+                # 空密码这次失败之后才建 ZIP 快速预筛（建它要读一次目录表）
                 password_filter = make_zip_password_filter(archive)
+
+        # 候选跑完了，云端可能还在算 MD5 / 等响应：它是最后一根稻草，等它。
+        due = take_cloud(wait=True)
+        if due is not None:
+            return due
 
         if self._ask_password is not None:
             for _ in range(3):
@@ -820,6 +1017,8 @@ class Pipeline:
                 try:
                     manual = self._ask_password({
                         "path": self._input_aliases.get(str(archive), str(archive)),
+                        # 让弹窗能交代"云端也查过了"，用户才知道下一步该找谁
+                        "cloud": self._cloud_note,
                     }) or ""
                 except Exception:
                     break
@@ -829,19 +1028,10 @@ class Pipeline:
                 if manual in seen:
                     continue
                 seen.add(manual)
-                self._emit({"kind": "phase", "task_id": task_id, "percent": 0,
-                            "message": "正在解压"})
-                result = self._run_extract(task_id, archive, out_dir, manual)
-                if result is None:
-                    return AttemptOutcome(message="用户取消", password_issue=False)
-                code, out, err = result
-                ok, wrong_pw, msg = classify_extract(code, out, err)
-                if ok:
-                    return AttemptOutcome(password=manual)
-                last_msg = msg
-                if not wrong_pw:
-                    return AttemptOutcome(message=last_msg, password_issue=False)
-                shutil.rmtree(out_dir, ignore_errors=True)
+                outcome, msg = self._try_password(task_id, archive, out_dir, manual)
+                if outcome is not None:
+                    return outcome
+                last_msg = msg or last_msg
         return AttemptOutcome(message=last_msg or "密码均不匹配", password_issue=True)
 
     def _enqueue_children(

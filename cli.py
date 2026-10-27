@@ -4,7 +4,7 @@
     python cli.py extract <目录或文件...> [--source 域名] [--max-depth 5]
                           [--samedir | --workdir] [--subdir 名字]
                           [--no-delete-intermediate] [--delete-original]
-                          [--force] [--timeout 秒]
+                          [--force] [--timeout 秒] [--cloud | --no-cloud]
     python cli.py pass-add <密码> [--source 域名]
     python cli.py pass-list
     python cli.py clean-workdir [--path 工作目录] [--yes] [--all]
@@ -75,9 +75,14 @@ def _print_report(report: RunReport, cfg: Config) -> None:
         print("-- 警告 --")
         for w in report.warnings:
             print(f"  {w}")
+    if report.notes:
+        print("-- 说明 --")
+        for n in report.notes:
+            print(f"  {n}")
     print(f"工作目录: {cfg.workdir}")
     print(f"密码库: {DEFAULT_DB}")
     print(f"解压超时: {cfg.extract_timeout:.0f}s/包")
+    print(f"云解密: {'开（与本地密码并行查询）' if cfg.cloud_unlock else '关'}")
 
 
 def _cmd_clean_workdir(args) -> int:
@@ -256,6 +261,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="已成功解压过的包也重新解压（关闭幂等跳过）")
     p_ext.add_argument("--timeout", type=float, default=None,
                        help="单个压缩包的解压超时秒数(默认 3600，超大包可调大)")
+    p_ext.add_argument("--cloud", action="store_true",
+                       help="本地密码都不匹配时向云端密码库查询(默认遵循 config.json)")
+    p_ext.add_argument("--no-cloud", action="store_true",
+                       help="本次运行禁用云解密，绝不出网")
 
     p_add = sub.add_parser("pass-add", help="手工添加密码")
     p_add.add_argument("password")
@@ -351,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
             print("[错误] --timeout 必须为正数")
             return 2
         overrides["extract_timeout"] = float(args.timeout)
+    # 云解密：命令行开关 > 配置。两个开关互斥，给了 --no-cloud 就以它为准。
+    if getattr(args, "no_cloud", False):
+        overrides["cloud_unlock"] = False
+    elif getattr(args, "cloud", False):
+        overrides["cloud_unlock"] = True
 
     # 输出模式：命令行开关 > 配置
     mode = pref.output_mode

@@ -168,6 +168,17 @@ class AppConfig:
     # 单个压缩包的解压超时（秒）。默认 3600 对超大包偏紧，被误杀时调大
     extract_timeout: int = 3600
 
+    # --- 云解密 ---
+    # 本地候选（文件名提示/来源派生/密码库/常用字典）**全部失败之后**，再向云端
+    # 密码库按文件 MD5 要一次密码（core/cloud_unlock.py）。默认开 —— 加密包在
+    # 本地猜不到密码时，这是命中率最高的一步。
+    # 只对「真的加密、且不是分卷」的包发起：明文包第一轮就成功了根本走不到这里，
+    # 分卷包的首卷 MD5 与云端索引的整包 MD5 对不上，查了也只会白烧一次配额。
+    cloud_unlock: bool = True
+    # 设备标识（32 位 hex）。留空 = 由本机信息派生，同一台机器恒为同一个值；
+    # 只有被风控时才需要换一个（协议报告 §5：复用同一值才能维持设备身份）。
+    cloud_unlock_udid: str = ""
+
     # --- 输入历史 ---
     remember_inputs: bool = True
     recent_inputs_limit: int = 30
@@ -255,6 +266,7 @@ class AppConfig:
 
         self.workdir = (self.workdir or "").strip()
         self.password_source = (self.password_source or "").strip()
+        self.cloud_unlock_udid = (self.cloud_unlock_udid or "").strip()
         # 容器目录名消毒复用 output_plan 的同一份实现，避免两处各写一份而漏掉盘符。
         # **空值是有意义的**：表示不要容器层，产物直接落在压缩包所在目录。所以不能
         # 像旧版那样把空值换回默认名——那会让"留空"这个表达永远无法生效。
@@ -302,6 +314,8 @@ class AppConfig:
             "overwrite_existing": self.overwrite_existing,
             "skip_done": self.skip_done,
             "extract_timeout": float(self.extract_timeout),
+            "cloud_unlock": self.cloud_unlock,
+            "cloud_unlock_udid": self.cloud_unlock_udid,
         }
 
     def note_inputs(self, paths: list[str]) -> None:

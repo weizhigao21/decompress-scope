@@ -17,6 +17,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from core.cloud_unlock import STATUS_ERROR, CloudUnlocker
 from core.config import Config
 from core.pipeline import Pipeline
 from core.store import TaskStore
@@ -108,3 +109,76 @@ class ExtractWorker(QObject):
         with self._pwd_lock:
             self._pwd_inbox.append(value)
         self._pwd_event.set()
+
+
+class CloudQueryJob:
+    """手动「云端取密码」按钮的后台任务：线程跑查询，主线程用 QTimer 轮询结果。
+
+    为什么是**轮询**而不是 Qt 信号：实测（Python 3.10 + PySide6 6.12）从普通
+    Python 线程 emit 一个 Qt 信号，会让整个进程随机
+    `Fatal Python error: Aborted`（崩在 `thread.join` 上，无栈无提示；
+    `tests/test_ui_worker.py` 那批用例在 0.7.1 上就能复现）。改成"线程写结果、
+    主线程来读"之后，跨线程只传一个 Python 对象引用，读取发生在主线程，
+    没有任何跨线程的 Qt 调用。
+
+    也刻意不用 QThread：右键那个紧凑窗口退场很快（结果目录一打开就关），用户
+    完全可能在查询途中把窗口关掉，而 QThread 在还跑着的时候被销毁会让进程崩溃；
+    daemon 线程随进程退出，不存在这个时序。
+
+    与 pipeline 内部的自动云端查询是两条独立路径：
+    - 自动那条在 core 里，本地候选跑过一段才走；
+    - 这条是手动的，用户点按钮就要立刻查，不看他有没有把自动云解密关掉。
+    """
+
+    def __init__(self, archive: str, udid: str = "", timeout: float = 10.0,
+                 unlocker=None):
+        self._archive = Path(archive)
+        self._unlocker = unlocker or CloudUnlocker(timeout=timeout, udid=udid)
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._result: dict | None = None
+
+    def start(self) -> bool:
+        """起一个后台线程；已经在跑就不重复起。返回是否真的起了一个。"""
+        if self.busy():
+            return False
+        self._thread = threading.Thread(
+            target=self._run, name="cloud-unlock", daemon=True)
+        self._thread.start()
+        return True
+
+    def busy(self) -> bool:
+        """还没拿到结果（界面用它禁掉重复点击）。"""
+        with self._lock:
+            if self._result is not None:
+                return False
+        return self._thread is not None and self._thread.is_alive()
+
+    def poll(self) -> dict | None:
+        """主线程调用：有结果就取走（只取到一次），否则 None。"""
+        with self._lock:
+            payload, self._result = self._result, None
+        return payload
+
+    def wait(self, timeout: float | None = None) -> None:
+        """测试用：等后台线程结束（正常流程不调用）。"""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def _run(self) -> None:
+        try:
+            result = self._unlocker.query(self._archive)
+            payload = {
+                "status": result.status,
+                "password": result.password,
+                "message": result.message,
+            }
+        except Exception as exc:  # noqa: BLE001 线程内兜底，错误回窗口
+            payload = {
+                "status": STATUS_ERROR,
+                "password": None,
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+        with self._lock:
+            self._result = payload

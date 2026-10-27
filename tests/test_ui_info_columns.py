@@ -449,3 +449,91 @@ def test_real_split_volume_e2e_shows_group_size(tmp_path, app):
     finally:
         win.close()
     app.processEvents()
+
+
+# ---------- notice 事件：乱码文件名修正的补充说明 ----------
+
+def _notice(message: str, detail=None, task_id: int = 1) -> dict:
+    ev = {"kind": "notice", "task_id": task_id, "message": message}
+    if detail is not None:
+        ev["detail"] = detail
+    return ev
+
+
+def test_notice_writes_info_column(win):
+    """notice 进「信息」列——它是有价值但不该打断流程的结果。"""
+    _feed(win, _task_event(), _notice("已修正 7 个乱码文件名"))
+
+    assert win.tree.topLevelItem(0).text(_col(win, "信息")) == "已修正 7 个乱码文件名"
+
+
+def test_notice_example_goes_to_tooltip_not_the_column(win):
+    """例子只进 tooltip：硬塞进列里会把整句折成省略号，数量也一起看不见。"""
+    detail = "已修正 7 个乱码文件名（Shift-JIS），例如 ｲ簗ﾔﾎﾄｼ.txt → 日本語.txt"
+    _feed(win, _task_event(), _notice("已修正 7 个乱码文件名", detail))
+    item = win.tree.topLevelItem(0)
+
+    assert item.text(_col(win, "信息")) == "已修正 7 个乱码文件名"
+    assert item.toolTip(_col(win, "信息")) == detail
+
+
+def test_notice_without_detail_falls_back_to_message(win):
+    """事件里没 detail（老版本 / 别的来路）时 tooltip 不能是空白。"""
+    _feed(win, _task_event(), _notice("已修正 2 个乱码文件名"))
+    item = win.tree.topLevelItem(0)
+
+    assert item.toolTip(_col(win, "信息")) == "已修正 2 个乱码文件名"
+
+
+def test_notice_survives_the_done_status(win):
+    """notice 先到、done 后到：信息列不能被"完成"擦掉。
+
+    真实顺序是 notice → done。done 分支只写状态/进度，不碰信息列——
+    谁哪天顺手在 done 里清空信息列，用户就再也看不到"改过名"这件事。
+    """
+    _feed(win, _task_event(), _notice("已修正 3 个乱码文件名"),
+          {"kind": "status", "task_id": 1, "status": "done",
+           "password_used": None, "error": "", "extracted_dir": r"E:/dl/pack"})
+    item = win.tree.topLevelItem(0)
+
+    assert item.text(_col(win, "状态")) == "完成"
+    assert item.text(_col(win, "信息")) == "已修正 3 个乱码文件名"
+
+
+def test_notice_sentence_actually_fits_the_info_column(app, win):
+    """短句要真的放得下：按真实字体与列宽算 elide，而不是"看着不长"。
+
+    历史：文案带着「（Shift-JIS）」时宽 203px，而默认 1000px 窗口的信息列只有
+    192px，界面上仍是省略号——"改短一点"这种判断靠肉眼必错，就得量。
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFontMetrics
+
+    from core.name_repair import NameRepair
+
+    win.show()
+    app.processEvents()
+
+    # 12 个是个位数变两位数后的边界：数字宽度变了也得放得下
+    text = NameRepair(renamed=12, encoding="Shift-JIS").summary()
+    col = _col(win, "信息")
+    width = win.tree.header().sectionSize(col)
+    fm = QFontMetrics(win.tree.font())
+    need = fm.horizontalAdvance(text)
+    avail = width - 12  # 单元格左右留白
+
+    assert avail >= need, (
+        f"信息列只有 {width}px，「{text}」需要 {need}px，界面上会被折成省略号")
+    assert fm.elidedText(text, Qt.ElideRight, avail) == text, "实际渲染仍被省略"
+
+
+def test_notice_for_unknown_task_ignored(app):
+    """任务不在树上（新一批已清空）时来了 notice，不能抛异常。"""
+    from ui.main_window import MainWindow
+
+    w = MainWindow()
+    try:
+        w._on_event(_notice("已修正 1 个乱码文件名", task_id=999))
+    finally:
+        w.close()
+    app.processEvents()

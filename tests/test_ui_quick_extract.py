@@ -314,3 +314,36 @@ def test_quick_window_typed_password_wins_before_candidates(app, tmp_path, monke
                 QTest.qWait(20)
         win.close()
         app.processEvents()
+
+
+def test_quick_window_reports_repaired_names_after_done(app, tmp_path, monkeypatch):
+    """「已修正 N 个乱码文件名」要活到"解压完成"那句里，例子挂 tooltip。
+
+    notice 事件在 done 之前到达，窗口若直接 setText，会被紧接着的完成语盖掉
+    （用户根本读不到）。例子一行放不下，就只能进 tooltip。
+    """
+    from core.pipeline import RunReport
+    from ui.quick_extract_window import QuickExtractWindow
+
+    out = tmp_path / "out"
+    out.mkdir()
+    win = QuickExtractWindow(["C:/Downloads/pack.zip"], autostart=False)
+    # 自动打开结果目录是另一条链路（还会碰真实偏好/资源管理器），这里不参与
+    monkeypatch.setattr(win, "_maybe_open_results", lambda: None)
+    try:
+        win._on_event({"kind": "task", "path": "C:/Downloads/pack.zip"})
+        win._on_event({"kind": "notice",
+                       "message": "已修正 7 个乱码文件名",
+                       "detail": "已修正 7 个乱码文件名（Shift-JIS），例如 A.txt → B.txt"})
+        win._on_event({"kind": "status", "status": "done"})
+
+        report = RunReport(done=1, output_dirs=[str(out)])
+        win._on_finished(report)
+
+        text = win.status_label.text()
+        assert "解压完成" in text
+        assert "已修正 7 个乱码文件名" in text
+        assert "Shift-JIS" in win.status_label.toolTip(), "例子没地方看"
+    finally:
+        win.close()
+        app.processEvents()

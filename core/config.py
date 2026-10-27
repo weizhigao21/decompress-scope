@@ -57,6 +57,13 @@ class Config:
     skip_done: bool = True
     list_timeout: float = 120.0
     extract_timeout: float = 3600.0
+    # 本地候选全失败后，是否再向云端密码库要一次密码（见 core/cloud_unlock.py）。
+    # 默认关：这是**需要发网络请求**的能力，测试与纯离线场景不该被动联网；
+    # 用户偏好（appconfig.cloud_unlock）默认开，经 as_overrides 传进来才生效。
+    cloud_unlock: bool = False
+    cloud_unlock_timeout: float = 10.0
+    # 空 = 由本机信息派生一个稳定值（见 cloud_unlock.default_device_id）
+    cloud_unlock_udid: str = ""
 
     @classmethod
     def create(cls, sevenzip: str | None = None, workdir: str | None = None, **overrides) -> "Config":

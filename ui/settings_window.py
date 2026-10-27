@@ -394,6 +394,45 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         form.addRow(self._field_label("密码尝试"),
                     self._stack(self.attempts_spin, self.attempts_hint))
 
+        # 云解密：本地线索全失败后的最后一步自动尝试。放在这一页而不是
+        # 「解压行为」：它解决的正是"密码从哪来"，用户找它时会先看密码页。
+        self.cloud_check = QCheckBox("加密包同时向云端密码库查询（与本地候选并行）")
+        self.cloud_check.setToolTip(
+            "加密包一进来就在后台线程里按文件 MD5 去问云端，本地候选照常一条条试；\n"
+            "谁先出结果用谁，云端一命中就插队用它解压。\n"
+            "需要联网，并且会消耗该服务的查询次数；关闭后程序不会发出任何云端请求。")
+        self.cloud_check.toggled.connect(self._sync_cloud_dependents)
+        self.cloud_hint = self._hint()
+        self.cloud_hint.setWordWrap(True)
+        form.addRow(self._field_label("云解密"),
+                    self._stack(self.cloud_check, self.cloud_hint))
+
+        self.cloud_udid_edit = QLineEdit()
+        self.cloud_udid_edit.setPlaceholderText("留空 = 自动派生（同一台机器恒定）")
+        self.cloud_udid_edit.setAcceptDrops(False)   # 同上，避免拖入路径变乱码
+        self.cloud_udid_edit.setToolTip(
+            "上报给云端的设备标识（32 位 hex）。留空时由本机信息派生，"
+            "同一台机器每次运行都是同一个值 —— 换掉它等于换了一台设备，"
+            "只在被风控时才需要。")
+        form.addRow(self._field_label("设备标识"), self.cloud_udid_edit)
+
+    def _sync_cloud_dependents(self) -> None:
+        """云解密的说明随开关切换：开着讲它什么时候出手、代价是什么，关着讲它不发包。"""
+        if self.cloud_check.isChecked():
+            # 注意：这里是纯文本 QLabel（不是富文本），别用 **加粗** 之类标记 ——
+            # 渲染出来就是一串星号。
+            self.cloud_hint.setText(
+                "加密包一进来就同时开两条线：云端（按文件 MD5 去问，后台线程）与"
+                "本地候选（文件名提示 → 来源派生 → 密码库 → 常用字典）。谁先出结果用谁；"
+                "云端一命中就插队，剩下的本地候选不再跑。\n"
+                "· 只对真加密的包发起：明文包第一轮空密码就解开了，永远走不到这一步；\n"
+                "· 分卷包跳过：云端按整包 MD5 索引，首卷的校验值对不上，查了也白查；\n"
+                "· 要联网，并消耗对方的查询次数（App 里显示的「云解密剩余次数」）。")
+        else:
+            self.cloud_hint.setText(
+                "已关闭：程序不会发出任何云端请求，只在本机的文件名、来源、密码库和"
+                "常用字典里找密码。右键窗口里的「云端取密码」按钮仍然可用（手动触发）。")
+
     def _page_behavior(self, col: QVBoxLayout) -> None:
         """纯开关页：整页只有开关，所以不必担心哪个控件被误读成上一行的附属说明。"""
         form = self._form(col, spacing=14)
@@ -620,6 +659,8 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
         self.ratio_spin.setValue(cfg.max_ratio)
         self.source_edit.setText(cfg.password_source)
         self.attempts_spin.setValue(cfg.max_password_attempts)
+        self.cloud_check.setChecked(cfg.cloud_unlock)
+        self.cloud_udid_edit.setText(cfg.cloud_unlock_udid)
         self.timeout_spin.setValue(cfg.extract_timeout)
         self.skip_done_check.setChecked(cfg.skip_done)
         self.sniff_check.setChecked(cfg.sniff_archives)
@@ -655,6 +696,8 @@ class SettingsWindow(GlassWindowMixin, QMainWindow):
             max_ratio=self.ratio_spin.value(),
             password_source=self.source_edit.text().strip(),
             max_password_attempts=self.attempts_spin.value(),
+            cloud_unlock=self.cloud_check.isChecked(),
+            cloud_unlock_udid=self.cloud_udid_edit.text().strip(),
             extract_timeout=self.timeout_spin.value(),
             skip_done=self.skip_done_check.isChecked(),
             sniff_archives=self.sniff_check.isChecked(),

@@ -756,10 +756,15 @@ class MainWindow(GlassWindowMixin, QMainWindow):
 
     def _on_need_password(self, info: dict) -> None:
         """工作线程卡在密码问询上，这里弹窗收答案（须把控制权交回事件循环）。"""
+        cloud_note = str(info.get("cloud") or "").strip()
+        # 云解密启用时把它的结论一并交代：用户才知道"自动的、云端的都试过了"，
+        # 而不是以为程序只试了几个常用密码就来问人。
+        cloud_line = f"{cloud_note}\n" if cloud_note else ""
         pwd, ok = QInputDialog.getText(
             self, "需要密码",
             f"压缩包：{info.get('path', '')}\n\n"
-            f"自动尝试的密码都不匹配，请输入：\n（留空或取消 = 跳过该包）",
+            f"自动尝试的密码都不匹配，请输入：\n{cloud_line}"
+            f"（留空或取消 = 跳过该包）",
         )
         if self._worker is not None:
             self._worker.submit_password(pwd if ok else None)
@@ -819,6 +824,19 @@ class MainWindow(GlassWindowMixin, QMainWindow):
             self.tree.scrollToItem(item)
         elif kind == "info":
             self._apply_archive_info(event)
+        elif kind == "notice":
+            # 补充说明（目前只有"已修正 N 个乱码文件名"）。放进信息列而不是弹窗：
+            # 它是有价值但不打断流程的结果，用户扫一眼任务树就知道发生了什么。
+            # 放在 done 之前到达，后续 status=done 不会覆盖这一列（只有 error /
+            # delivery_error 才会），所以它能留在那里。
+            item = self._task_items.get(event.get("task_id"))
+            if item is None:
+                return
+            text = str(event.get("message") or "")
+            item.setText(_COL_INFO, text[:140])
+            # 例子只放在 tooltip：信息列宽度有限，硬塞会把整句 elide 成省略号，
+            # 结果连"修了几个"都看不全。
+            item.setToolTip(_COL_INFO, str(event.get("detail") or text))
         elif kind == "status":
             item = self._task_items.get(event.get("task_id"))
             if item is None:
