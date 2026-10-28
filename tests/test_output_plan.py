@@ -345,3 +345,38 @@ def test_same_volume_false_when_stat_fails(tmp_path):
     """
     assert same_volume(tmp_path / "gone", tmp_path) is False
     assert same_volume(tmp_path, tmp_path / "no" / "such" / "dir") is False
+
+
+def test_overwrite_does_not_stage_when_target_is_absent(tmp_path):
+    """覆盖开着、但目标目录还不存在：直接解到源目录，别再走一遍暂存。
+
+    暂存的唯一作用是保护**用户已有的文件**。目标不存在时它只是白白多一次
+    整树复制（实测 28GB 从 C 盘搬到 F 盘要几分钟，界面停「解压 100%」不动，
+    中途关窗就只剩工作目录里那 28GB —— 用户报的就是这个）。
+    """
+    cfg = _cfg(tmp_path, overwrite_existing=True)
+    archive = _task(tmp_path, "comic.cbz")
+    base = tmp_path / "src" / "comic"
+    assert not base.exists()
+
+    plan = plan_output(archive, cfg, OUTPUT_SAMEDIR)
+
+    assert plan.out_dir == base, "目标不存在还先解到工作目录 = 白复制一遍"
+    assert plan.final_dir == base
+    assert plan.copy_back is False, "直解到终位就不该再有交付动作"
+
+
+def test_overwrite_still_stages_when_target_dir_exists(tmp_path):
+    """配重：真要合并进已有目录时必须暂存 —— 那层保护不能顺手丢掉。"""
+    cfg = _cfg(tmp_path, overwrite_existing=True)
+    archive = _task(tmp_path, "comic.cbz")
+    base = tmp_path / "src" / "comic"
+    base.mkdir(parents=True)
+    (base / "mine.txt").write_text("用户自己的文件", encoding="utf-8")
+
+    plan = plan_output(archive, cfg, OUTPUT_SAMEDIR)
+
+    assert plan.out_dir != base, "解压不能直接写进用户已有目录"
+    assert plan.final_dir == base
+    assert plan.copy_back is True
+    assert plan.overwrite is True

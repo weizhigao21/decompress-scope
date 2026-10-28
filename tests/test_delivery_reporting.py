@@ -167,7 +167,9 @@ def test_copy_back_failure_is_persisted(tmp_path, monkeypatch):
     def boom(*_a, **_kw):
         raise OSError("磁盘空间不足")
 
-    monkeypatch.setattr(pipeline_mod.shutil, "copytree", boom)
+    # 注入点在"复制一个文件"这一层：交付已改为按块复制（可报进度、可取消），
+    # 不再走 shutil.copytree —— 打 copytree 的补丁会落空，测试就成了假绿。
+    monkeypatch.setattr(pipeline_mod, "_copy_file_chunked", boom)
     report = RunReport()
     pipe._deliver([task], report)
 
@@ -287,3 +289,91 @@ def test_cli_report_shows_delivery_failure_section(tmp_path):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------- 跨卷交付：要有进度、要能取消 ----------
+
+def test_cross_volume_delivery_reports_progress(tmp_path, monkeypatch):
+    """跨卷搬产物时每一段都要有进度事件，而不是只在最后冒出来一句。
+
+    用户报的就是这个：7z 打到 100%，界面一直停在「正在解压… 100%」，因为
+    28GB 的产物正在 C 盘 → F 盘搬，中间一条事件都没有。
+    """
+    pipe, store, cfg = _mk_pipe(tmp_path)
+    task = _mk_task(store, archive_path=str(tmp_path / "downloads" / "pack.zip"),
+                    depth=0, status=TaskStatus.DONE)
+    out_dir = _mk_out_dir(cfg.workdir, task.id, "pack")
+    (out_dir / "second.bin").write_bytes(b"y" * 64)
+    final = tmp_path / "downloads" / "pack"
+    pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=final, copy_back=True)
+    events = _events(pipe)
+    monkeypatch.setattr(pipeline_mod, "same_volume", lambda a, b: False)
+
+    pipe._deliver([task], RunReport())
+
+    phases = [e for e in events if e.get("kind") == "phase"]
+    assert phases, "跨卷交付一条进度事件都没发，界面只能干等"
+    percents = [e["percent"] for e in phases]
+    assert percents == sorted(percents), "进度必须单调不回退"
+    assert percents[0] == 0, f"第一句要立刻把界面从「解压 100%」切走（实际 {percents[:3]}）"
+    assert percents[-1] == 100
+    assert all("交付到源目录" in e.get("message", "") for e in phases)
+    assert (final / "payload.bin").read_bytes() == b"x" * 64
+    store.close()
+
+
+def test_delivery_cancel_records_why_and_drops_partial_target(tmp_path, monkeypatch):
+    """交付中途取消：不算失败、产物留在工作目录、半成品目标目录要收掉。
+
+    半成品最坑 —— 源目录里那棵树看着完整、其实缺文件，用户会以为是包坏了。
+    """
+    pipe, store, cfg = _mk_pipe(tmp_path)
+    task = _mk_task(store, archive_path=str(tmp_path / "downloads" / "pack.zip"),
+                    depth=0, status=TaskStatus.DONE)
+    out_dir = _mk_out_dir(cfg.workdir, task.id, "pack")
+    final = tmp_path / "downloads" / "pack"
+    pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=final, copy_back=True)
+    events = _events(pipe)
+    monkeypatch.setattr(pipeline_mod, "same_volume", lambda a, b: False)
+    pipe._should_cancel = lambda: True
+
+    report = RunReport()
+    pipe._deliver([task], report)
+
+    assert "交付被取消" in task.delivery_error, task.delivery_error
+    assert str(out_dir) in task.delivery_error, "得告诉用户产物现在在哪"
+    assert not final.exists(), "自己建的半成品目录没有收掉"
+    assert (out_dir / "payload.bin").is_file(), "工作目录里的产物不能动"
+    assert store.get(task.id).delivery_error == task.delivery_error, "取消没落库"
+    assert store.get(task.id).status == TaskStatus.DONE, "取消不该把解压结果判成失败"
+
+    pipe._fill_report(report, [task])
+    assert report.delivery_failed == 1 and report.failed == 0
+    assert any(e.get("kind") == "warning" for e in events)
+    store.close()
+
+
+def test_delivery_cancel_keeps_pre_existing_target_intact(tmp_path, monkeypatch):
+    """覆盖合并进**用户已有目录**时取消：一个用户文件都不许删。
+
+    与上一条的分界是"这个目标目录是不是我建的"：不是就别碰 —— 里面混着
+    用户自己的文件，删半成品等于把人家东西一起删了。
+    """
+    pipe, store, cfg = _mk_pipe(tmp_path)
+    task = _mk_task(store, archive_path=str(tmp_path / "downloads" / "pack.zip"),
+                    depth=0, status=TaskStatus.DONE)
+    out_dir = _mk_out_dir(cfg.workdir, task.id, "pack")
+    final = tmp_path / "downloads" / "pack"
+    final.mkdir(parents=True)
+    (final / "mine.txt").write_text("用户自己的文件", encoding="utf-8")
+    pipe._plans[task.id] = OutputPlan(out_dir=out_dir, final_dir=final,
+                                      copy_back=True, overwrite=True)
+    _events(pipe)
+    monkeypatch.setattr(pipeline_mod, "same_volume", lambda a, b: False)
+    pipe._should_cancel = lambda: True
+
+    pipe._deliver([task], RunReport())
+
+    assert (final / "mine.txt").read_text(encoding="utf-8") == "用户自己的文件"
+    assert "交付被取消" in task.delivery_error
+    store.close()

@@ -347,3 +347,34 @@ def test_quick_window_reports_repaired_names_after_done(app, tmp_path, monkeypat
     finally:
         win.close()
         app.processEvents()
+
+
+def test_quick_window_leaves_the_100_percent_line_for_delivery(app):
+    """7z 到 100% 之后还有「交付」这一段，界面必须跟着换话。
+
+    用户报的正是这里：进度条满格、状态栏一直写「正在解压… 100%」，其实程序
+    正在把 28GB 产物从 C 盘搬到 F 盘 —— 一句话不变，看着就是卡死。
+    """
+    from ui.quick_extract_window import QuickExtractWindow
+
+    win = QuickExtractWindow(["C:/Downloads/pack.zip"], autostart=False)
+    try:
+        win._on_event({"kind": "task", "path": "C:/Downloads/pack.zip"})
+        win._on_event({"kind": "status", "status": "extracting"})
+        win._on_event({"kind": "progress", "percent": 100})
+        assert "正在解压… 100%" in win.status_label.text()
+
+        win._on_event({"kind": "phase", "percent": 0,
+                       "message": "正在交付到源目录"})
+
+        text = win.status_label.text()
+        assert "正在解压" not in text, f"100% 之后还挂在解压那句话上：{text}"
+        assert "正在交付到源目录" in text
+        assert win.progress.value() == 0
+
+        win._on_event({"kind": "phase", "percent": 64,
+                       "message": "正在交付到源目录"})
+        assert win.progress.value() == 64, "交付进度没有反映到进度条"
+    finally:
+        win.close()
+        app.processEvents()

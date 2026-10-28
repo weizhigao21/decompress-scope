@@ -149,18 +149,21 @@ def plan_output(    task,
             target = anchor / archive_dir_name(archive)
         return OutputPlan(out_dir=out_dir, final_dir=target, copy_back=target is not None)
 
-    # 覆盖模式也必须先解到工作目录。直接往用户已有目录写入后，密码错误、取消
-    # 或 7z 报错时无法区分“本次写入”与用户原有文件，清理现场会误删原文件。
-    # 成功后才把 staging 树交付到目标目录，保留覆盖同名项的既有语义。
+    # 覆盖模式只在**真要合并进已有目录**时才先解到工作目录。直接往用户已有
+    # 目录写入后，密码错误、取消或 7z 报错时无法区分"本次写入"与用户原有文件，
+    # 清理现场会误删原文件 —— 这层保护只有存在用户文件时才需要。
+    #
+    # 目标不是目录（不存在，或是与包同名的**文件**）时一律直接解到终位：
+    # ① 不存在 = 没有东西要保护，暂存只会多一次整树复制（实测 28GB 从 C 盘到
+    #    F 盘要几分钟，界面停在「解压 100%」一动不动，中途关窗只剩工作目录里
+    #    那 28GB —— 用户报的就是这个）；
+    # ② 同名位置是文件时不走暂存，`unique_path` 会避让成 "包名~2"：无扩展名的
+    #    包 `RJ01116988`（百度网盘常见）目录路径正是包文件自己，硬写会 WinError 183。
     base = anchor / archive_dir_name(archive)
     if force_new:
         final = unique_path(base)
         return OutputPlan(out_dir=final, final_dir=final)
-    # 覆盖语义只对「已存在的同名**目录**」成立——把解出来的树合并进它。
-    # 同名位置若是文件，则无从合并，硬写会 WinError 183：无扩展名的包
-    # `RJ01116988`（百度网盘常见）包名与产物目录名一模一样，它的目录路径
-    # 就是包文件自己的路径。这种情形必须照常避让成 "包名~2"。
-    if cfg.overwrite_existing and not base.is_file():
+    if cfg.overwrite_existing and base.is_dir():
         return OutputPlan(
             out_dir=out_dir,
             final_dir=base,

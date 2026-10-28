@@ -47,6 +47,37 @@ from .vault import PasswordVault
 # 这里额外留一点余量给算 MD5。
 _CLOUD_WAIT_GRACE = 5.0
 
+# 交付（跨卷复制）每次读写多少字节。8 MiB 兼顾两件事：块越大系统调用越少，
+# 但块太大时"取消"与"报进度"的粒度也跟着变粗 —— 20GB 的包体文件按 8 MiB
+# 分块是 2500 个检查点，足够及时。
+_COPY_CHUNK = 8 * 1024 * 1024
+
+
+class DeliveryCancelled(Exception):
+    """用户取消时打断了产物交付（跨卷复制中途停下）。
+
+    单独一个异常类型：交付里"用户不干了"和"磁盘满/没权限"必须分开处理——
+    前者不是故障，产物完整留在工作目录里，措辞也不该是"失败"。
+    """
+
+
+def _copy_file_chunked(src: Path, dst: Path, on_chunk, should_cancel) -> None:
+    """按块复制一个文件，顺带保留时间戳。
+
+    单独成函数是为了有个明确的注入点：交付失败/取消的守卫要能在"复制到一半"
+    这一层抛错，而 `shutil` 的接口既报不了进度也插不进取消检查。
+    """
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            if should_cancel():
+                raise DeliveryCancelled("用户取消交付")
+            chunk = fin.read(_COPY_CHUNK)
+            if not chunk:
+                break
+            fout.write(chunk)
+            on_chunk(len(chunk))
+    shutil.copystat(src, dst)
+
 
 @dataclass
 class RunReport:
@@ -1114,10 +1145,34 @@ class Pipeline:
                 target = dst
             else:
                 target = dst if not dst.exists() else unique_path(dst)
+            created = not target.exists()
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                self._place_tree(src, target)
+                self._place_tree(
+                    src, target,
+                    on_progress=lambda pct, _t=t: self._emit({
+                        "kind": "phase", "task_id": _t.id, "percent": pct,
+                        # 百分比交给进度条，话里不再重复：界面那句后面还会
+                        # 拼上「（已用时 m:ss）」，塞个数字进去读着别扭
+                        "message": "正在交付到源目录",
+                    }),
+                    should_cancel=self._cancel_requested,
+                )
+            except DeliveryCancelled:
+                # 用户不干了：把**自己刚建的**半个目标目录收掉，产物原样留在
+                # 工作目录。不删的话源目录会留下一棵看似完整、其实缺文件的树 ——
+                # 那种"半成品"比没有更糟，用户会以为是这个包本身有问题。
+                if created:
+                    shutil.rmtree(target, ignore_errors=True)
+                self._record_delivery_failure(
+                    t,
+                    f"交付被取消（产物完整保留在工作目录 {src}）：{target}",
+                    report,
+                )
+                continue
             except (OSError, shutil.Error) as exc:
+                if created:
+                    shutil.rmtree(target, ignore_errors=True)
                 self._record_delivery_failure(
                     t,
                     f"交付到源目录失败（产物仍在工作目录 {src}）：{target} — {exc}",
@@ -1138,12 +1193,13 @@ class Pipeline:
                 report.warnings.append(msg)
                 self._emit({"kind": "warning", "message": msg})
 
-    def _place_tree(self, src: Path, dst: Path) -> None:
+    def _place_tree(self, src: Path, dst: Path, on_progress=None,
+                    should_cancel=None) -> None:
         """把 src 交付到 dst。
 
         同卷优先 rename：单个系统调用、原子、不占额外磁盘，因此不需要
         "留在工作目录"的兜底副本。跨卷时 rename 会在系统层退化成逐文件
-        拷贝且中途失败会留下半成品，所以仍走 copytree，把工作目录那份
+        拷贝且中途失败会留下半成品，所以仍走逐文件复制，把工作目录那份
         留作安全网。rename 撞上竞态（目标被并发创建）时同样回落复制。
         """
         if same_volume(src, dst.parent):
@@ -1151,8 +1207,67 @@ class Pipeline:
                 os.rename(src, dst)
                 return
             except OSError:
-                pass  # 回落 copytree：可能跨设备，或目标刚被并发创建
-        shutil.copytree(src, dst, dirs_exist_ok=True)
+                pass  # 回落复制：可能跨设备，或目标刚被并发创建
+        self._copy_tree(src, dst, on_progress, should_cancel)
+
+    def _copy_tree(self, src: Path, dst: Path, on_progress=None,
+                   should_cancel=None) -> None:
+        """跨卷交付：逐文件复制，带字节进度与取消点。
+
+        不用 `shutil.copytree` 的两条硬理由（都是实测踩到的）：
+        ① 它报不了进度 —— 28GB 从 C 盘到 F 盘要几分钟，界面只能停在
+           「解压 100%」一动不动，用户以为程序卡死；
+        ② 它不能被打断 —— 用户关窗之后复制仍在后台跑，跑完才算完，中途被杀
+           就留下一棵缺文件的半成品树（调用方负责按 `created` 收掉）。
+
+        大文件按块复制：一个 20GB 的包体文件本身就要搬几十秒，只在"文件之间"
+        报进度等于一个文件一条进度，照样是卡死的样子；取消点也必须进到块循环
+        里，否则点取消要等当前文件搬完（可能几分钟）。
+        """
+        entries: list[tuple[Path, int | None]] = []
+        total = 0
+        for root, dirs, names in os.walk(src):
+            rootp = Path(root)
+            entries.extend((rootp / d, None) for d in dirs)
+            for name in names:
+                path = rootp / name
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                entries.append((path, size))
+                total += size
+
+        dst.mkdir(parents=True, exist_ok=True)
+        state = {"done": 0, "last": -1}
+
+        def cancelled() -> bool:
+            return should_cancel is not None and bool(should_cancel())
+
+        def advance(nbytes: int) -> None:
+            state["done"] += nbytes
+            pct = int(state["done"] * 100 / total) if total else 100
+            if pct != state["last"]:
+                state["last"] = pct
+                if on_progress is not None:
+                    on_progress(pct)
+
+        # 立刻报一次 0%：界面要在开始搬的第一秒就从「正在解压 100%」切到
+        # 「正在交付 0%」。等到搬完第一个文件才说话，一个 20GB 的包体文件
+        # 就能让这句话晚几十秒才出现 —— 那正是用户以为卡死的那一刻。
+        advance(0)
+
+        for path, size in entries:
+            if cancelled():
+                raise DeliveryCancelled("用户取消交付")
+            target = dst / path.relative_to(src)
+            if size is None:
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_file_chunked(path, target, advance, cancelled)
+        if total == 0 and on_progress is not None:
+            on_progress(100)
 
 
     def _fill_report(self, report: RunReport, run_tasks: list[Task]) -> None:
